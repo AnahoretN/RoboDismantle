@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout:*)",
+      "Bash(npm run dev)",
+      "Bash(npx tsc:*)",
+      "Bash(npx typescript --noEmit)",
+      "Bash(npx -p typescript tsc:*)",
+      "Bash(npm install)",
+      "Bash(curl:*)",
+      "Bash(node:*)",
+      "Bash(npm install:*)",
+      "Bash(npm run build:*)"
+    ]
+  }
+}
