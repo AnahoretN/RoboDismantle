@@ -96,24 +96,26 @@ export interface RemotePlayer extends Robot {
   color: string;
 }
 
-// Состояние врага для синхронизации
-export interface EnemyState {
-  id: string; // Уникальный ID врага
+// Минимальное состояние врага для синхронизации (только то, что нужно)
+export interface EnemySyncState {
+  id: string;
   x: number;
   y: number;
-  vx: number;
-  vy: number;
-  width: number;
-  height: number;
   hp: number;
-  type: 'DRONE' | 'TURRET';
-  lastFired: number;
-  fireRate: number;
-  facing?: number; // Направление (для турелей)
+  alive: boolean; // для удаления/создания
+}
+
+// Выстрел игрока - только точка и направление
+export interface PlayerShot {
+  playerId: string;
+  x: number;
+  y: number;
+  angle: number;
+  weapon: 'left' | 'right'; // какое оружие
 }
 
 export interface NetworkMessage {
-  type: 'PLAYER_UPDATE' | 'PROJECTILE_FIRED' | 'PLAYER_DAMAGE' | 'GAME_STATE' | 'PLAYER_DIED' | 'ENEMY_DIED' | 'LIMB_LOST' | 'PLAYER_JOINED' | 'PLAYER_DISCONNECTED' | 'PLAYER_NAME_CHANGE' | 'PAUSE_TOGGLE' | 'GAME_START' | 'ENEMY_UPDATE' | 'ENEMY_SPAWN' | 'FULL_SYNC';
+  type: 'PLAYER_UPDATE' | 'PLAYER_SHOT' | 'ENEMY_SYNC' | 'PLAYER_DAMAGE' | 'GAME_STATE' | 'PLAYER_DIED' | 'ENEMY_DIED' | 'LIMB_LOST' | 'PLAYER_JOINED' | 'PLAYER_DISCONNECTED' | 'PLAYER_NAME_CHANGE' | 'PAUSE_TOGGLE' | 'GAME_START';
   playerId: string;
   data: any;
   timestamp: number;

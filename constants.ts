@@ -1,7 +1,7 @@
 export const GRAVITY = 0.6;
 export const FRICTION = 0.8;
 export const PLAYER_SPEED = 8;
-export const PLAYER_JUMP = -14;
+export const PLAYER_JUMP = -17.5; // Увеличен на 25% (было -14)
 export const ROBOT_SIZE = 40;
 export const BULLET_SPEED = 24;
 
@@ -28,4 +28,15 @@ export const PLAYER_COLORS = [
 export const DEFAULT_ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
+  // Бесплатный TURN сервер от openrelayproject (могут меняться)
+  {
+    urls: 'turn:openrelay.metered.ca:80',
+    username: 'openrelayproject',
+    credential: 'openrelayproject'
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443',
+    username: 'openrelayproject',
+    credential: 'openrelayproject'
+  }
 ];

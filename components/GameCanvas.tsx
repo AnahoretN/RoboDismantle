@@ -1,21 +1,31 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import {
-  GameState, Robot, LimbType, Projectile, Enemy, Platform,
-  Limb, ImpactVFX, GameMode, RemotePlayer, NetworkMessage, EnemyState
+  GameState, Robot, LimbType, Enemy, Platform,
+  Limb, GameMode, RemotePlayer, NetworkMessage
 } from '../types';
 import {
   GRAVITY, FRICTION, PLAYER_JUMP,
   ROBOT_SIZE, BULLET_SPEED, ARM_MAX_HP, LEG_MAX_HP, TORSO_MAX_HP, HEAD_MAX_HP, COLORS, PLAYER_COLORS
 } from '../constants';
 import HUD from './HUD';
-import { WebRTCManager, generatePlayerId, ConnectionStatus, PlayerInfo } from '../lib/WebRTCManager';
+import { WebRTCManager, ConnectionStatus, PlayerInfo } from '../lib/WebRTCManager';
 
-// Карта для хранения интерполированных состояний врагов на стороне гостя
-interface InterpolatedEnemy extends Enemy {
+// Враг на клиенте с ID
+interface EnemyWithId extends Enemy {
   id: string;
+  // Поля для интерполяции на клиенте (не хост)
+  targetX?: number;
+  targetY?: number;
+  interpolationStartTime?: number;
+}
+
+// Карта интерполяции для каждого врага на клиенте
+interface EnemyInterpolation {
   targetX: number;
   targetY: number;
-  lastUpdate: number;
+  startTime: number;
+  startX: number;
+  startY: number;
 }
 
 interface GameCanvasProps {
@@ -52,8 +62,11 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
   const [connectedPlayers, setConnectedPlayers] = useState<PlayerInfo[]>([]);
   const lastNetworkUpdate = useRef<number>(0);
-  const lastEnemySync = useRef<number>(0);
   const enemyIdCounter = useRef<number>(0);
+  const lastLimbsHash = useRef<string>(''); // Для оптимизации отправки limbs
+  const canvasRect = useRef<DOMRect | null>(null); // Кэш для getBoundingClientRect
+  // Интерполяция врагов на клиенте (targetX, targetY, startTime, startX, startY)
+  const enemyInterpolationRef = useRef<Map<string, EnemyInterpolation>>(new Map());
 
   // Определяем режим мультиплеера и роль игрока
   const isMultiplayer = gameMode === GameMode.MULTI_PLAYER;
@@ -133,16 +146,16 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
 
       switch (message.type) {
         case 'PLAYER_UPDATE': {
-          const { id, x, y, vx, vy, facing, limbs } = message.data;
+          const { id, x, y, vx, vy, facing, limbs, onGround } = message.data;
           const existing = remotePlayersRef.current.get(id);
 
           if (existing) {
-            // Интерполяция для плавности
             existing.x = x;
             existing.y = y;
             existing.vx = vx;
             existing.vy = vy;
             existing.facing = facing;
+            if (onGround !== undefined) existing.onGround = onGround;
             if (limbs) {
               Object.entries(limbs).forEach(([key, limbData]: [string, any]) => {
                 if (existing.limbs[key as LimbType]) {
@@ -151,28 +164,33 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
               });
             }
           } else {
-            // Создаём нового удалённого игрока
             const newPlayer: RemotePlayer = {
               ...getDefaultPlayerState(),
               id,
-              color: PLAYER_COLORS[Math.min(connectedPlayers.length, 3)], // Цвет по порядку
+              color: PLAYER_COLORS[Math.min(connectedPlayers.length, 3)],
               x, y, vx, vy, facing,
               limbs: limbs || getDefaultPlayerState().limbs
             };
+            if (onGround !== undefined) newPlayer.onGround = onGround;
             remotePlayersRef.current.set(id, newPlayer);
           }
           break;
         }
 
-        case 'PROJECTILE_FIRED': {
-          const { x, y, vx, vy, color } = message.data;
+        case 'PLAYER_SHOT': {
+          // Игрок выстрелил - создаём снаряд локально
+          const { x, y, angle, color } = message.data;
+          const projVx = Math.cos(angle) * BULLET_SPEED;
+          const projVy = Math.sin(angle) * BULLET_SPEED;
+
           s.projectiles.push({
-            x, y, vx, vy,
+            x, y, vx: projVx, vy: projVy,
             width: 8, height: 8,
             owner: 'REMOTE_PLAYER',
+            ownerId: message.playerId, // Запоминаем кто выстрелил
             damage: 10,
             color
-          });
+          } as any);
           break;
         }
 
@@ -184,14 +202,13 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
         }
 
         case 'PLAYER_JOINED': {
-          // Новый игрок подключился
-          const { id, name, color } = message.data;
+          const { id, color } = message.data;
           if (!remotePlayersRef.current.has(id)) {
             const newPlayer: RemotePlayer = {
               ...getDefaultPlayerState(),
               id,
               color: color || PLAYER_COLORS[1],
-              x: 100, y: 300, // Начальная позиция
+              x: 100, y: 300,
               vx: 0, vy: 0, facing: 0,
               limbs: getDefaultPlayerState().limbs
             };
@@ -201,14 +218,30 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
         }
 
         case 'PAUSE_TOGGLE': {
-          // Пауза обрабатывается в App.tsx
+          break;
+        }
+
+        case 'PLAYER_DAMAGE': {
+          // Другой игрок нанёс урон нам
+          const { targetId, limbKey, damage } = message.data;
+          if (targetId === localPlayerId) {
+            const limb = s.player.limbs[limbKey as LimbType];
+            if (limb && limb.exists) {
+              limb.hp -= damage;
+              s.player.stunTimer = 12;
+              if (limb.hp <= 0) {
+                limb.exists = false;
+                if (limbKey === LimbType.TORSO || limbKey === LimbType.HEAD) {
+                  s.gameOver = true;
+                }
+              }
+            }
+          }
           break;
         }
 
         case 'GAME_START': {
-          // Хост начал игру - все игроки respawn
           const ground = s.platforms[0];
-          // Каждый игрок получает случайную точку на платформе
           const spawnX = ground.x + 100 + Math.random() * (ground.width - 200);
           const spawnY = ground.y - 100;
 
@@ -225,84 +258,57 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
           break;
         }
 
-        case 'ENEMY_UPDATE': {
-          // Обновление состояния врагов от хоста (для гостей)
+        case 'ENEMY_SYNC': {
+          // Хост отправляет состояние врагов 2 раза в секунду
           if (!isHost) {
             const { enemies } = message.data;
-            const enemyMap = new Map<string, InterpolatedEnemy>();
+            const enemyMap = new Map<string, any>();
+            const now = Date.now();
+            const interpolationMap = enemyInterpolationRef.current;
 
             // Создаём карту существующих врагов
             s.enemies.forEach((e: any) => {
               if (e.id) enemyMap.set(e.id, e);
             });
 
-            // Обновляем или создаём врагов
-            enemies.forEach((enemyData: EnemyState) => {
+            enemies.forEach((enemyData: any) => {
               const existing = enemyMap.get(enemyData.id);
               if (existing) {
-                // Обновляем целевую позицию для интерполяции
-                existing.targetX = enemyData.x;
-                existing.targetY = enemyData.y;
-                existing.x = enemyData.x; // Для простоты используем прямую позицию
-                existing.y = enemyData.y;
-                existing.vx = enemyData.vx;
-                existing.vy = enemyData.vy;
-                existing.hp = enemyData.hp;
-                existing.lastFired = enemyData.lastFired;
-                existing.lastUpdate = Date.now();
-              } else {
-                // Создаём нового врага
-                const newEnemy: InterpolatedEnemy = {
-                  ...enemyData,
-                  id: enemyData.id,
+                // Устанавливаем целевую позицию для интерполяции
+                interpolationMap.set(enemyData.id, {
                   targetX: enemyData.x,
                   targetY: enemyData.y,
-                  lastUpdate: Date.now()
+                  startTime: now,
+                  startX: existing.x,
+                  startY: existing.y
+                });
+                existing.hp = enemyData.hp;
+              } else {
+                // Создаём нового врага (без интерполяции для первого появления)
+                const newEnemy: any = {
+                  x: enemyData.x,
+                  y: enemyData.y,
+                  width: 35,
+                  height: 35,
+                  vx: 0,
+                  vy: 0,
+                  hp: enemyData.hp,
+                  type: 'DRONE',
+                  lastFired: 0,
+                  fireRate: 1500 + Math.random() * 1000,
+                  id: enemyData.id
                 };
-                s.enemies.push(newEnemy as any);
+                s.enemies.push(newEnemy);
               }
             });
 
-            // Удаляем врагов, которых больше нет на хосте
-            const receivedIds = new Set(enemies.map((e: EnemyState) => e.id));
+            // Удаляем врагов, которых нет на хосте
+            const receivedIds = new Set(enemies.map((e: any) => e.id));
             s.enemies = s.enemies.filter((e: any) => !e.id || receivedIds.has(e.id));
-          }
-          break;
-        }
-
-        case 'ENEMY_SPAWN': {
-          // Спавн нового врага от хоста
-          if (!isHost) {
-            const { enemy } = message.data;
-            const newEnemy: InterpolatedEnemy = {
-              ...enemy,
-              id: enemy.id,
-              targetX: enemy.x,
-              targetY: enemy.y,
-              lastUpdate: Date.now()
-            };
-            s.enemies.push(newEnemy as any);
-          }
-          break;
-        }
-
-        case 'FULL_SYNC': {
-          // Полная синхронизация состояния игры от хоста
-          if (!isHost) {
-            const { enemies, score } = message.data;
-
-            // Синхронизируем врагов
-            s.enemies = enemies.map((e: EnemyState) => ({
-              ...e,
-              targetX: e.x,
-              targetY: e.y,
-              lastUpdate: Date.now()
-            } as any));
-
-            // Синхронизируем счёт (опционально)
-            if (score !== undefined) {
-              s.score = score;
-            }
+            // Также удаляем интерполяцию для удалённых врагов
+            Array.from(interpolationMap.keys()).forEach(id => {
+              if (!receivedIds.has(id)) interpolationMap.delete(id);
+            });
           }
           break;
         }
@@ -334,8 +340,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
   // Инициализация для мультиплеера
   useEffect(() => {
     if (gameMode === GameMode.MULTI_PLAYER && webrtcManager) {
-      // Подписываемся на изменения списка игроков
-      webrtcManager.onPlayerListChange((players) => {
+      webrtcManager.onPlayerListChange((players: PlayerInfo[]) => {
         setConnectedPlayers(players);
       });
       setConnectedPlayers(webrtcManager.getConnectedPlayers());
@@ -363,37 +368,12 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     else { spawnX = s.camera.x + Math.random() * canvas.width; spawnY = s.camera.y - margin; }
 
     const enemyId = `enemy_${enemyIdCounter.current++}_${Date.now()}`;
-    const enemy: Enemy & { id: string } = {
+    const enemy: EnemyWithId = {
       id: enemyId,
       x: spawnX, y: spawnY, width: 35, height: 35, vx: 0, vy: 0,
-      hp: 30, type: 'DRONE', lastFired: Date.now(), fireRate: 1500 + Math.random() * 1000
+      hp: 30, type: 'DRONE', lastFired: 0, fireRate: 1500 + Math.random() * 1000
     };
     s.enemies.push(enemy);
-
-    // В мультиплеере отправляем информацию о новом враге
-    if (isMultiplayer && isHost && webrtcManager?.isConnected()) {
-      const realPlayerId = webrtcManager.getPeerId();
-      webrtcManager.send({
-        type: 'ENEMY_SPAWN',
-        playerId: realPlayerId,
-        data: {
-          enemy: {
-            id: enemyId,
-            x: spawnX,
-            y: spawnY,
-            width: 35,
-            height: 35,
-            vx: 0,
-            vy: 0,
-            hp: 30,
-            type: 'DRONE',
-            lastFired: enemy.lastFired,
-            fireRate: enemy.fireRate
-          }
-        },
-        timestamp: Date.now()
-      });
-    }
   };
 
   // Отправка обновления позиции по сети
@@ -401,12 +381,22 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     if (!webrtcManager || !webrtcManager.isConnected()) return;
 
     const now = Date.now();
-    if (now - lastNetworkUpdate.current < 50) return; // Максимум 20 обновлений в секунду
+    if (now - lastNetworkUpdate.current < 50) return;
     lastNetworkUpdate.current = now;
 
     const p = stateRef.current.player;
-    // Используем реальный peer ID из WebRTCManager
     const realPlayerId = webrtcManager.getPeerId();
+
+    // Оптимизация: вычисляем hash limbs только если что-то изменилось
+    const limbsChanged = Object.values(p.limbs).some((l: Limb) => !l.exists || l.hp < l.maxHp);
+    let limbsToSend = undefined;
+    if (limbsChanged) {
+      const hash = JSON.stringify(p.limbs);
+      if (hash !== lastLimbsHash.current) {
+        lastLimbsHash.current = hash;
+        limbsToSend = p.limbs;
+      }
+    }
 
     webrtcManager.send({
       type: 'PLAYER_UPDATE',
@@ -417,50 +407,57 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
         vx: p.vx,
         vy: p.vy,
         facing: p.facing,
-        limbs: p.limbs
+        onGround: p.onGround,
+        limbs: limbsToSend
       },
       timestamp: now
     });
   }, [webrtcManager]);
 
-  // Отправка состояния врагов по сети (только для хоста)
-  const sendEnemyUpdate = useCallback(() => {
-    if (!webrtcManager || !webrtcManager.isConnected() || !isHost) return;
+  // Отправка состояния врагов 2 раза в секунду (только хост)
+  const lastEnemySyncRef = useRef<number>(0);
+  const sendEnemySync = useCallback(() => {
+    if (!webrtcManager?.isConnected() || !isHost) return;
 
     const now = Date.now();
-    if (now - lastEnemySync.current < 100) return; // Максимум 10 обновлений в секунду для врагов
-    lastEnemySync.current = now;
+    if (now - lastEnemySyncRef.current < 500) return; // 2 раза в секунду
+    lastEnemySyncRef.current = now;
 
     const s = stateRef.current;
     const realPlayerId = webrtcManager.getPeerId();
 
-    // Подготавливаем данные врагов для отправки
-    const enemiesData: EnemyState[] = s.enemies.map((e: any) => ({
-      id: e.id || 'unknown',
+    // Собираем состояние врагов
+    const enemiesData = s.enemies.map((e: any) => ({
+      id: e.id,
       x: e.x,
       y: e.y,
-      vx: e.vx,
-      vy: e.vy,
-      width: e.width,
-      height: e.height,
-      hp: e.hp,
-      type: e.type,
-      lastFired: e.lastFired,
-      fireRate: e.fireRate
+      hp: e.hp
     }));
 
     webrtcManager.send({
-      type: 'ENEMY_UPDATE',
+      type: 'ENEMY_SYNC',
       playerId: realPlayerId,
       data: { enemies: enemiesData },
       timestamp: now
     });
   }, [webrtcManager, isHost]);
 
+  // Отправка выстрела игрока
+  const sendPlayerShot = useCallback((x: number, y: number, angle: number, color: string) => {
+    if (!webrtcManager?.isConnected()) return;
+
+    const realPlayerId = webrtcManager.getPeerId();
+    webrtcManager.send({
+      type: 'PLAYER_SHOT',
+      playerId: realPlayerId,
+      data: { x, y, angle, color },
+      timestamp: Date.now()
+    });
+  }, [webrtcManager]);
+
   const update = () => {
     const s = stateRef.current;
 
-    // Проверка паузы - при пауза всё замирает (даже враги и снаряды)
     if (isPaused || s.gameOver) return;
 
     const p = s.player;
@@ -477,7 +474,8 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       p.vy = PLAYER_JUMP * (p.stunTimer > 0 ? 0.8 : 1.0);
       p.onGround = false;
     }
-    lastKeys.current = { ...keys.current };
+    // Оптимизация: отслеживаем только пробел для прыжка
+    lastKeys.current['Space'] = keys.current['Space'];
     p.vx *= FRICTION;
     p.vy += GRAVITY;
     p.x += p.vx;
@@ -489,7 +487,6 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       p.limbs[LimbType.TORSO].hp = 0;
       p.limbs[LimbType.TORSO].exists = false;
 
-      // Уведомляем о смерти
       if (webrtcManager?.isConnected()) {
         const realPlayerId = webrtcManager.getPeerId();
         webrtcManager.send({
@@ -502,7 +499,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     }
 
     p.onGround = false;
-    s.platforms.forEach(plat => {
+    s.platforms.forEach((plat: Platform) => {
       if (p.x + p.width > plat.x && p.x < plat.x + plat.width) {
         const feetPos = p.y + p.height;
         if (feetPos >= plat.y && feetPos <= plat.y + plat.height + Math.max(0, p.vy) + 1) {
@@ -529,8 +526,12 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       }
     }
 
-    // Стрельба
-    const rect = canvasRef.current?.getBoundingClientRect();
+    // Стрельба (оптимизация: кэшируем getBoundingClientRect)
+    let rect = canvasRect.current;
+    if (!rect || rect.width !== canvasRef.current?.width || rect.height !== canvasRef.current?.height) {
+      rect = canvasRef.current?.getBoundingClientRect() || null;
+      canvasRect.current = rect;
+    }
     if (rect) {
       const worldMouseX = mouse.current.x - rect.left + s.camera.x;
       const worldMouseY = mouse.current.y - rect.top + s.camera.y;
@@ -538,71 +539,121 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       p.facing = Math.atan2(worldMouseY - shoulderY, worldMouseX - (p.x + p.width / 2));
       const now = Date.now();
 
-      // Левая рука
+      // Левая рука (оптимизация: вычисляем trig один раз)
+      const cosFacing = Math.cos(p.facing);
+      const sinFacing = Math.sin(p.facing);
+      const projSpeedX = cosFacing * BULLET_SPEED;
+      const projSpeedY = sinFacing * BULLET_SPEED;
+
       if (mouse.current.left && p.limbs.LEFT_ARM.exists && now - p.leftWeapon.lastFired > p.leftWeapon.cooldown) {
-        const projX = p.x + p.width / 2 - 15 + Math.cos(p.facing) * 28;
-        const projY = shoulderY + Math.sin(p.facing) * 28;
-        const projVx = Math.cos(p.facing) * BULLET_SPEED;
-        const projVy = Math.sin(p.facing) * BULLET_SPEED;
+        const projX = p.x + p.width / 2 - 15 + cosFacing * 28;
+        const projY = shoulderY + sinFacing * 28;
 
         s.projectiles.push({
-          x: projX, y: projY, vx: projVx, vy: projVy,
+          x: projX, y: projY, vx: projSpeedX, vy: projSpeedY,
           width: 8, height: 8, owner: 'PLAYER', damage: 10, color: p.leftWeapon.color
         });
         p.leftWeapon.lastFired = now;
 
-        // Отправляем информацию о выстреле в мультиплеере
-        if (webrtcManager?.isConnected()) {
-          const realPlayerId = webrtcManager.getPeerId();
-          webrtcManager.send({
-            type: 'PROJECTILE_FIRED',
-            playerId: realPlayerId,
-            data: { x: projX, y: projY, vx: projVx, vy: projVy, color: p.leftWeapon.color },
-            timestamp: now
-          });
+        if (isMultiplayer) {
+          sendPlayerShot(projX, projY, p.facing, p.leftWeapon.color);
         }
       }
 
       // Правая рука
       if (mouse.current.right && p.limbs.RIGHT_ARM.exists && now - p.rightWeapon.lastFired > p.rightWeapon.cooldown) {
-        const projX = p.x + p.width / 2 + 15 + Math.cos(p.facing) * 28;
-        const projY = shoulderY + Math.sin(p.facing) * 28;
-        const projVx = Math.cos(p.facing) * BULLET_SPEED;
-        const projVy = Math.sin(p.facing) * BULLET_SPEED;
+        const projX = p.x + p.width / 2 + 15 + cosFacing * 28;
+        const projY = shoulderY + sinFacing * 28;
 
         s.projectiles.push({
-          x: projX, y: projY, vx: projVx, vy: projVy,
+          x: projX, y: projY, vx: projSpeedX, vy: projSpeedY,
           width: 8, height: 8, owner: 'PLAYER', damage: 10, color: p.rightWeapon.color
         });
         p.rightWeapon.lastFired = now;
 
-        // Отправляем информацию о выстреле в мультиплеере
-        if (webrtcManager?.isConnected()) {
-          const realPlayerId = webrtcManager.getPeerId();
-          webrtcManager.send({
-            type: 'PROJECTILE_FIRED',
-            playerId: realPlayerId,
-            data: { x: projX, y: projY, vx: projVx, vy: projVy, color: p.rightWeapon.color },
-            timestamp: now
-          });
+        if (isMultiplayer) {
+          sendPlayerShot(projX, projY, p.facing, p.rightWeapon.color);
         }
       }
     }
 
-    // Спавн врагов (только для одиночной игры и хоста)
-    if (gameMode === GameMode.SINGLE_PLAYER || isHost) {
-      if (s.enemies.length < 5 + Math.floor(s.score / 2000) && Math.random() < 0.02) {
-        spawnEnemy();
+    // Спавн врагов - локально на каждом клиенте независимо
+    // Интенсивность снижена на 25% (было 0.02, стало 0.015)
+    // В мультиплеере каждый клиент спавнит врагов самостоятельно для визуализации
+    const maxEnemies = gameMode === GameMode.SINGLE_PLAYER
+      ? 5 + Math.floor(s.score / 2000)
+      : 3 + Math.floor(s.score / 3000); // Меньше врагов в мультиплеере для оптимизации
+
+    if (s.enemies.length < maxEnemies && Math.random() < 0.015) {
+      spawnEnemy();
+    }
+
+    // Интерполяция врагов на клиенте (только для гостей)
+    // Двигаем врагов к целевой позиции в течение 0.45 секунд
+    if (!isHost && isMultiplayer) {
+      const now = Date.now();
+      const INTERPOLATION_TIME = 450; // 0.45 секунды в миллисекундах
+
+      s.enemies.forEach((enemy: any) => {
+        if (enemy.id) {
+          const interp = enemyInterpolationRef.current.get(enemy.id);
+          if (interp) {
+            const elapsed = now - interp.startTime;
+            if (elapsed < INTERPOLATION_TIME) {
+              // Линейная интерполяция к целевой позиции
+              const t = elapsed / INTERPOLATION_TIME; // 0..1
+              enemy.x = interp.startX + (interp.targetX - interp.startX) * t;
+              enemy.y = interp.startY + (interp.targetY - interp.startY) * t;
+            } else {
+              // Время истекло - устанавливаем целевую позицию
+              enemy.x = interp.targetX;
+              enemy.y = interp.targetY;
+              enemyInterpolationRef.current.delete(enemy.id);
+            }
+          }
+        }
+      });
+    }
+
+    // Обновление врагов - локально на всех клиентах
+    // Каждый враг выбирает случайного игрока (локального или удалённого) как цель
+    s.enemies.forEach((enemy, idx) => {
+      // Собираем всех игроков: локального + удалённых
+      const allPlayers: Robot[] = [p];
+      remotePlayersRef.current.forEach((rp) => {
+        if (rp.limbs[LimbType.TORSO].exists) { // Только живые игроки
+          allPlayers.push(rp);
+        }
+      });
+
+      // Выбираем случайного игрока как цель (но меняем редко для плавности)
+      if (!(enemy as any).targetPlayerId || Math.random() < 0.01) {
+        const targetPlayer = allPlayers[Math.floor(Math.random() * allPlayers.length)];
+        (enemy as any).targetPlayerId = targetPlayer === p ? 'local' : (targetPlayer as RemotePlayer).id;
       }
 
-      // Обновление врагов (только хост вычисляет AI)
-      s.enemies.forEach((enemy, idx) => {
-        const dx = p.x + p.width / 2 - enemy.x;
-        const dy = p.y + p.height / 2 - enemy.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        const angle = Math.atan2(dy, dx);
-        const desired = 250 + Math.sin(Date.now() / 1000 + idx) * 50;
+      // Находим цель
+      const targetId = (enemy as any).targetPlayerId;
+      let target = p;
+      if (targetId !== 'local') {
+        const found = remotePlayersRef.current.get(targetId);
+        if (found && found.limbs[LimbType.TORSO].exists) {
+          target = found;
+        } else {
+          target = p; // Fallback на локального игрока
+        }
+      }
 
+      const dx = target.x + target.width / 2 - enemy.x;
+      const dy = target.y + target.height / 2 - enemy.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const angle = Math.atan2(dy, dx);
+      const desired = 250 + Math.sin(Date.now() / 1000 + idx) * 50;
+
+      // На клиенте пропускаем обновление позиции, если есть активная интерполяция
+      const hasActiveInterpolation = !isHost && isMultiplayer && (enemy as any).id && enemyInterpolationRef.current.has((enemy as any).id);
+
+      if (!hasActiveInterpolation) {
         if (dist > desired + 50) {
           enemy.vx += Math.cos(angle) * 0.35;
           enemy.vy += Math.sin(angle) * 0.35;
@@ -614,27 +665,28 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
         enemy.vy *= 0.94;
         enemy.x += enemy.vx;
         enemy.y += enemy.vy;
+      }
 
-        if (Date.now() - enemy.lastFired > enemy.fireRate && dist < 800) {
-          const pool = (Object.values(p.limbs) as Limb[]).filter(l => l.exists).map(l => l.type);
-          s.projectiles.push({
-            x: enemy.x + enemy.width / 2,
-            y: enemy.y + enemy.height / 2,
-            vx: Math.cos(angle) * 8,
-            vy: Math.sin(angle) * 8,
-            width: 8, height: 8,
-            owner: 'ENEMY',
-            damage: 8,
-            color: COLORS.ENEMY,
-            targetLimb: pool[Math.floor(Math.random() * pool.length)]
-          });
-          enemy.lastFired = Date.now();
-        }
-      });
-    }
+      // Стрельба по цели
+      if (Date.now() - enemy.lastFired > enemy.fireRate && dist < 800) {
+        const pool = (Object.values(target.limbs) as Limb[]).filter(l => l.exists).map(l => l.type);
+        s.projectiles.push({
+          x: enemy.x + enemy.width / 2,
+          y: enemy.y + enemy.height / 2,
+          vx: Math.cos(angle) * 8,
+          vy: Math.sin(angle) * 8,
+          width: 8, height: 8,
+          owner: 'ENEMY',
+          damage: 8,
+          color: COLORS.ENEMY,
+          targetLimb: pool[Math.floor(Math.random() * pool.length)]
+        });
+        enemy.lastFired = Date.now();
+      }
+    });
 
     // Обновление снарядов
-    s.projectiles = s.projectiles.filter(proj => {
+    s.projectiles = s.projectiles.filter((proj) => {
       proj.x += proj.vx;
       proj.y += proj.vy;
       if (Math.abs(proj.x - p.x) > 2000) return false;
@@ -665,6 +717,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
           return false;
         }
       } else if (proj.owner === 'PLAYER' || proj.owner === 'REMOTE_PLAYER') {
+        // Проверяем попадание по врагам
         for (let i = s.enemies.length - 1; i >= 0; i--) {
           const e = s.enemies[i];
           if (proj.x > e.x && proj.x < e.x + e.width && proj.y > e.y && proj.y < e.y + e.height) {
@@ -677,12 +730,67 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
             return false;
           }
         }
+
+        // Friendly fire: проверяем попадание по другим игрокам в мультиплеере
+        if (isMultiplayer) {
+          for (const [id, target] of remotePlayersRef.current) {
+            // Определяем владельца пули
+            let ownerId: string;
+            if (proj.owner === 'PLAYER') {
+              ownerId = localPlayerId;
+            } else if (proj.owner === 'REMOTE_PLAYER') {
+              ownerId = (proj as any).ownerId;
+              if (!ownerId) continue; // Нет ID - пропускаем
+            } else {
+              continue;
+            }
+
+            // Пропускаем если пуля принадлежит этому игроку (нельзя себя ранить)
+            if (ownerId === id) continue;
+
+            // Проверка попадания
+            if (proj.x > target.x && proj.x < target.x + target.width &&
+                proj.y > target.y && proj.y < target.y + target.height) {
+              // Выбираем случайную конечность для попадания
+              const limbs = Object.entries(target.limbs).filter(([_, l]: [string, any]) => l.exists);
+              if (limbs.length > 0) {
+                const [limbKey, limb] = limbs[Math.floor(Math.random() * limbs.length)] as [LimbType, Limb];
+
+                let finalDamage = proj.damage * (limb.damageMultiplier || 1.0);
+                if (limbKey === LimbType.TORSO || limbKey === LimbType.HEAD) {
+                  const activeLimbs = [LimbType.LEFT_ARM, LimbType.RIGHT_ARM, LimbType.LEFT_LEG, LimbType.RIGHT_LEG]
+                    .filter(t => target.limbs[t].exists).length;
+                  finalDamage *= (1 - activeLimbs * 0.15);
+                }
+
+                limb.hp -= finalDamage;
+
+                // Отправляем сообщение о повреждении
+                if (proj.owner === 'PLAYER' && webrtcManager?.isConnected()) {
+                  webrtcManager.send({
+                    type: 'PLAYER_DAMAGE',
+                    playerId: localPlayerId,
+                    data: {
+                      targetId: id,
+                      limbKey,
+                      damage: finalDamage
+                    },
+                    timestamp: Date.now()
+                  });
+                }
+
+                spawnVFX(proj.x, proj.y, proj.color, 15);
+                return false;
+              }
+            }
+          }
+        }
       }
 
       return true;
     });
 
-    s.vfx = s.vfx.filter(v => { v.life--; return v.life > 0; });
+    s.vfx = s.vfx.filter((v) => { v.life--; return v.life > 0; });
 
     // Обновление камеры
     const canvas = canvasRef.current;
@@ -693,9 +801,9 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
 
     setHudState({ ...s });
 
-    // Отправляем сетевое обновление
+    // Отправляем сетевые обновления
     sendNetworkUpdate();
-    sendEnemyUpdate(); // Отправляем состояние врагов (только хост)
+    sendEnemySync();
   };
 
   const drawPlayer = (
@@ -704,9 +812,9 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     color: string,
     isLocal: boolean
   ) => {
-    const isCrouching = keys.current['KeyS'] || keys.current['ArrowDown'];
-    const crouchOff = isCrouching && isLocal ? p.height * 0.2 : 0;
-    const headOff = isCrouching && isLocal ? 8 : 0;
+    const isCrouching = isLocal ? (keys.current['KeyS'] || keys.current['ArrowDown']) : false;
+    const crouchOff = isCrouching ? p.height * 0.2 : 0;
+    const headOff = isCrouching ? 8 : 0;
     const centerX = p.x + p.width / 2;
     const centerY = p.y + p.height / 2 - 5;
     const hipY = centerY + 10;
@@ -733,7 +841,8 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
 
     const time = Date.now() / 120;
     const walk = Math.abs(p.vx) > 0.5 ? Math.sin(time) * 0.6 : 0;
-    const jump = !(p as any).onGround ? (p.vy < 0 ? -0.4 : 0.4) : 0;
+    const onGround = (p as any).onGround ?? true;
+    const jump = !onGround ? (p.vy < 0 ? -0.4 : 0.4) : 0;
 
     // Рисуем ноги
     drawLimb(LimbType.LEFT_LEG, centerX - 8, hipY, 25, 10, Math.PI / 2 + walk + jump, color);
@@ -777,7 +886,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
 
     // Имя игрока для удалённых
     if (!isLocal) {
-      ctx.fillStyle = color;
+      ctx.fillStyle = (p as RemotePlayer).color;
       ctx.font = '10px monospace';
       ctx.textAlign = 'center';
       ctx.fillText('P2', centerX, p.y - 15);
@@ -811,7 +920,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     }
 
     // Платформы
-    s.platforms.forEach(plat => {
+    s.platforms.forEach((plat) => {
       ctx.fillStyle = COLORS.PLATFORM;
       ctx.shadowBlur = 15;
       ctx.shadowColor = 'black';
@@ -819,7 +928,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     });
 
     // Удалённые игроки
-    remotePlayersRef.current.forEach(remotePlayer => {
+    remotePlayersRef.current.forEach((remotePlayer) => {
       drawPlayer(ctx, remotePlayer, remotePlayer.color, false);
     });
 
@@ -827,7 +936,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     drawPlayer(ctx, p, getPlayerColor(), true);
 
     // Враги
-    s.enemies.forEach(e => {
+    s.enemies.forEach((e) => {
       ctx.save();
       ctx.translate(e.x + e.width / 2, e.y + e.height / 2);
       ctx.rotate(e.vx * 0.05);
@@ -839,7 +948,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     });
 
     // Снаряды
-    s.projectiles.forEach(pr => {
+    s.projectiles.forEach((pr) => {
       ctx.fillStyle = pr.color;
       ctx.shadowBlur = 10;
       ctx.shadowColor = pr.color;
@@ -849,7 +958,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     });
 
     // VFX
-    s.vfx.forEach(v => {
+    s.vfx.forEach((v) => {
       ctx.globalAlpha = v.life / v.maxLife;
       ctx.fillStyle = 'white';
       ctx.shadowBlur = 20;
@@ -897,7 +1006,6 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
   const handleRestart = useCallback(() => {
     const s = stateRef.current;
     const ground = s.platforms[0];
-    // Случайная точка спавна на нижней платформе
     const spawnX = ground.x + 100 + Math.random() * (ground.width - 200);
     const spawnY = ground.y - 100;
 
@@ -912,13 +1020,12 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     s.camera = { x: spawnX - window.innerWidth / 2, y: spawnY - window.innerHeight / 2 };
     setHudState({ ...s });
 
-    // В мультиплеере отправляем сигнал о рестарте
     if (isMultiplayer && webrtcManager && isHost) {
       const realPlayerId = webrtcManager.getPeerId();
       webrtcManager.send({
         type: 'GAME_START',
         playerId: realPlayerId,
-        data: { spawnX, spawnY }, // Хост сообщает свою точку спавна
+        data: { spawnX, spawnY },
         timestamp: Date.now()
       });
     }
