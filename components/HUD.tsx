@@ -146,18 +146,16 @@ const HUD: React.FC<HUDProps> = ({
     <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-6">
       {/* Top Center Score and Timer */}
       <div className="self-center flex flex-col items-center gap-2">
-        {/* Game Timer */}
+        {/* Timer and Score in one line */}
         {!gameEnded && !gameOver && (
-          <div className={`bg-black/40 px-6 py-1 rounded-full border border-white/10 backdrop-blur-sm ${gameTimeLeft <= 60 ? 'animate-pulse border-red-500/50' : ''}`}>
-            <span className={`font-mono text-lg tracking-widest ${gameTimeLeft <= 60 ? 'text-red-400' : 'text-yellow-400'}`}>
+          <div className="bg-black/40 px-6 py-2 rounded-full border border-white/10 backdrop-blur-sm flex items-center gap-4">
+            <span className={`font-mono text-lg tracking-widest ${gameTimeLeft <= 60 ? 'text-red-400 animate-pulse' : 'text-yellow-400'}`}>
               {formatTime(gameTimeLeft)}
             </span>
+            <span className="text-white/30">|</span>
+            <span className="text-cyan-500 font-mono text-xl tracking-widest">{score.toString().padStart(6, '0')}</span>
           </div>
         )}
-
-        <div className="bg-black/40 px-6 py-2 rounded-full border border-white/10 backdrop-blur-sm">
-          <span className="text-cyan-500 font-mono text-xl tracking-widest">{score.toString().padStart(6, '0')}</span>
-        </div>
 
         {/* Multiplayer Connection Status */}
         {isMultiplayer && (
