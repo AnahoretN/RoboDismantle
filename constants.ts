@@ -1,7 +1,8 @@
 export const GRAVITY = 0.6;
 export const FRICTION = 0.8;
-export const PLAYER_SPEED = 8;
+export const PLAYER_SPEED = 10; // Увеличена на 25% (было 8)
 export const PLAYER_JUMP = -17.5; // Увеличен на 25% (было -14)
+export const ACCELERATION_TIME = 1000; // Время (мс) для набора полной скорости (1 секунда)
 export const ROBOT_SIZE = 40;
 export const BULLET_SPEED = 24;
 

@@ -38,10 +38,12 @@ export class WebRTCManager {
   // Инициализация хоста
   async initAsHost(): Promise<string> {
     if (this.isInitialized) {
+      console.log('[WebRTCManager] Already initialized as host');
       return this.getInviteLink(this.hostPeerId || '');
     }
     this.isInitialized = true;
     this.setStatus('connecting');
+    console.log('[WebRTCManager] Initializing as host...');
 
     // Закрываем предыдущий peer если есть
     if (this.peer) {
@@ -50,32 +52,46 @@ export class WebRTCManager {
 
     // Создаём уникальный ID для комнаты
     const roomId = this.generateRoomId();
+    console.log('[WebRTCManager] Generated room ID:', roomId);
 
     this.peer = new Peer(roomId, {
-      debug: 0 // Отключаем debug чтобы не спамить в консоль
+      debug: 1 // Включаем debug для более подробных логов
     });
 
     return new Promise((resolve, reject) => {
       if (!this.peer) return;
 
+      // Таймаут инициализации
+      const timeout = setTimeout(() => {
+        console.error('[WebRTCManager] Host initialization timeout');
+        this.setStatus('error');
+        reject(new Error('Host initialization timeout'));
+      }, 15000);
+
       this.peer.on('open', (id) => {
-        console.log('Host peer opened with ID:', id);
+        clearTimeout(timeout);
+        console.log('[WebRTCManager] Host peer opened with ID:', id);
         this.hostPeerId = id;
         this.localPlayerId = id; // Обновляем localPlayerId на реальный peer ID
 
         // Добавляем хоста в список игроков
         this.addPlayer(this.localPlayerId, this.localPlayerName, PLAYER_COLORS[0]);
+        console.log('[WebRTCManager] Host added to player list');
 
         // Хост принимает входящие соединения
         this.peer.on('connection', (conn) => {
+          console.log('[WebRTCManager] Host received connection event from:', conn.peer);
           this.handleIncomingConnection(conn);
         });
 
+        console.log('[WebRTCManager] Host ready, invite link:', this.getInviteLink(id));
         resolve(this.getInviteLink(id));
       });
 
       this.peer.on('error', (err) => {
-        console.error('Peer error:', err);
+        clearTimeout(timeout);
+        console.error('[WebRTCManager] Peer error:', err);
+        console.error('[WebRTCManager] Error type:', err.type);
         this.setStatus('error');
         reject(err);
       });
@@ -85,11 +101,14 @@ export class WebRTCManager {
   // Инициализация гостя через PeerJS
   async joinAsGuest(hostPeerId: string): Promise<void> {
     if (this.isInitialized) {
+      console.log('[WebRTCManager] Already initialized, skipping joinAsGuest');
       return;
     }
     this.isInitialized = true;
     this.setStatus('connecting');
     this.hostPeerId = hostPeerId;
+
+    console.log('[WebRTCManager] Guest joining room:', hostPeerId);
 
     // Закрываем предыдущий peer если есть
     if (this.peer) {
@@ -98,14 +117,23 @@ export class WebRTCManager {
 
     // Создаём peer для гостя
     this.peer = new Peer(undefined, {
-      debug: 0
+      debug: 1 // Включаем debug для более подробных логов
     });
 
     return new Promise((resolve, reject) => {
       if (!this.peer) return;
 
+      // Таймаут подключения
+      const timeout = setTimeout(() => {
+        console.error('[WebRTCManager] Connection timeout - peer did not open in 15 seconds');
+        this.setStatus('error');
+        reject(new Error('Connection timeout'));
+      }, 15000);
+
       this.peer.on('open', (id) => {
-        console.log('Guest peer opened with ID:', id);
+        clearTimeout(timeout);
+        console.log('[WebRTCManager] Guest peer opened with ID:', id);
+        console.log('[WebRTCManager] Attempting to connect to host:', hostPeerId);
 
         // Обновляем localPlayerId на реальный peer ID
         this.localPlayerId = id;
@@ -116,17 +144,43 @@ export class WebRTCManager {
           serialization: 'json'
         });
 
+        if (!conn) {
+          console.error('[WebRTCManager] Failed to create connection to host');
+          this.setStatus('error');
+          reject(new Error('Failed to create connection'));
+          return;
+        }
+
+        console.log('[WebRTCManager] Connection object created, peer:', conn.peer, 'connection type:', conn.serialization);
+
+        // Логируем события соединения для отладки
+        conn.on('open', () => {
+          console.log('[WebRTCManager] Connection OPEN event fired for host:', hostPeerId);
+        });
+
+        conn.on('error', (err) => {
+          console.error('[WebRTCManager] Connection ERROR event:', err);
+        });
+
+        conn.on('close', () => {
+          console.log('[WebRTCManager] Connection CLOSE event fired');
+        });
+
         this.setupConnection(conn);
       });
 
       this.peer.on('error', (err) => {
-        console.error('Peer error:', err);
+        clearTimeout(timeout);
+        console.error('[WebRTCManager] Peer error:', err);
+        console.error('[WebRTCManager] Error type:', err.type);
+        console.error('[WebRTCManager] Error message:', err.message);
         this.setStatus('error');
         reject(err);
       });
 
       // Резолвим когда подключимся
       const onStatusChange = (status: ConnectionStatus) => {
+        console.log('[WebRTCManager] Status change:', status);
         if (status === 'connected') {
           this.offStatusChange(onStatusChange);
           resolve();
@@ -143,34 +197,45 @@ export class WebRTCManager {
   private handleIncomingConnection(conn: DataConnection): void {
     const peerId = conn.peer;
 
+    console.log('[WebRTCManager] Incoming connection from:', peerId);
+    console.log('[WebRTCManager] Current players:', this.connectedPlayers.size, '/', MAX_PLAYERS);
+
     // Проверяем лимит игроков
     if (this.connectedPlayers.size >= MAX_PLAYERS) {
+      console.log('[WebRTCManager] Room full, rejecting connection from:', peerId);
       conn.close();
       return;
     }
 
-    console.log('Incoming connection from:', peerId);
+    // Логируем события соединения для отладки
+    conn.on('error', (err) => {
+      console.error('[WebRTCManager] Incoming connection error from', peerId, err);
+    });
+
     this.setupConnection(conn);
   }
 
   // Настройка соединения
   private setupConnection(conn: DataConnection): void {
     const peerId = conn.peer;
+    console.log('[WebRTCManager] Setting up connection with peer:', peerId, 'isHost:', this.isHost);
 
     conn.on('open', () => {
-      console.log('Connection opened with:', peerId);
+      console.log('[WebRTCManager] Connection opened with:', peerId, 'isHost:', this.isHost);
       this.connections.set(peerId, conn);
+      console.log('[WebRTCManager] Total connections:', this.connections.size);
 
       if (this.isHost) {
         // Добавляем гостя в список игроков на стороне хоста
         const guestIndex = this.connectedPlayers.size;
-        this.addPlayer(
-          peerId,
-          `Player ${guestIndex + 1}`,
-          PLAYER_COLORS[guestIndex % PLAYER_COLORS.length]
-        );
+        const guestName = `Player ${guestIndex + 1}`;
+        const guestColor = PLAYER_COLORS[guestIndex % PLAYER_COLORS.length];
+
+        console.log('[WebRTCManager] Host: Adding guest', guestName, 'with color', guestColor);
+        this.addPlayer(peerId, guestName, guestColor);
 
         // Хост отправляет список игроков новому подключившемуся
+        console.log('[WebRTCManager] Host: Sending GAME_STATE to new guest');
         this.sendToPeer(peerId, {
           type: 'GAME_STATE',
           playerId: this.localPlayerId,
@@ -181,18 +246,20 @@ export class WebRTCManager {
         });
 
         // Хост рассылает всем о новом игроке
+        console.log('[WebRTCManager] Host: Broadcasting PLAYER_JOINED to all');
         this.broadcast({
           type: 'PLAYER_JOINED',
           playerId: this.localPlayerId,
           data: {
             id: peerId,
-            name: `Player ${guestIndex + 1}`,
-            color: PLAYER_COLORS[guestIndex % PLAYER_COLORS.length]
+            name: guestName,
+            color: guestColor
           },
           timestamp: Date.now()
         });
       } else {
         // Гость отправляет своё имя хосту при подключении
+        console.log('[WebRTCManager] Guest: Sending PLAYER_NAME_CHANGE to host');
         this.sendToPeer(this.hostPeerId!, {
           type: 'PLAYER_NAME_CHANGE',
           playerId: this.localPlayerId,
@@ -201,7 +268,9 @@ export class WebRTCManager {
         });
       }
 
+      console.log('[WebRTCManager] Updating connection status...');
       this.updateConnectionStatus();
+      console.log('[WebRTCManager] New status:', this.currentStatus);
     });
 
     conn.on('data', (data) => {
@@ -329,8 +398,14 @@ export class WebRTCManager {
   // Отправить сообщение конкретному пиру
   private sendToPeer(peerId: string, message: NetworkMessage): void {
     const conn = this.connections.get(peerId);
-    if (conn && conn.open) {
-      conn.send(message);
+    if (conn) {
+      if (conn.open) {
+        conn.send(message);
+      } else {
+        console.warn('[WebRTCManager] Cannot send to', peerId, '- connection not open. State:', conn.connectionState, 'peer connection:', conn.peerConnection?.iceConnectionState);
+      }
+    } else {
+      console.warn('[WebRTCManager] Cannot send to', peerId, '- no connection found. Available:', Array.from(this.connections.keys()));
     }
   }
 

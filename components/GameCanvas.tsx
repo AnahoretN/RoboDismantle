@@ -4,7 +4,7 @@ import {
   Limb, GameMode, RemotePlayer, NetworkMessage, Star
 } from '../types';
 import {
-  GRAVITY, FRICTION, PLAYER_JUMP,
+  GRAVITY, FRICTION, PLAYER_SPEED, PLAYER_JUMP, ACCELERATION_TIME,
   ROBOT_SIZE, BULLET_SPEED, ARM_MAX_HP, LEG_MAX_HP, TORSO_MAX_HP, HEAD_MAX_HP, COLORS, PLAYER_COLORS
 } from '../constants';
 import HUD from './HUD';
@@ -116,6 +116,8 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     x: 100, y: 300, width: ROBOT_SIZE, height: ROBOT_SIZE * 1.5,
     vx: 0, vy: 0, facing: 0, isJumping: false, onGround: false,
     stunTimer: 0,
+    moveStartTime: undefined,
+    lastMoveDir: 0,
     limbs: {
       [LimbType.TORSO]: { type: LimbType.TORSO, hp: TORSO_MAX_HP, maxHp: TORSO_MAX_HP, exists: true, damageMultiplier: 1.0 },
       [LimbType.HEAD]: { type: LimbType.HEAD, hp: HEAD_MAX_HP, maxHp: HEAD_MAX_HP, exists: true, damageMultiplier: 1.0 },
@@ -171,8 +173,13 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
 
       switch (message.type) {
         case 'PLAYER_UPDATE': {
-          const { id, x, y, vx, vy, facing, limbs, onGround } = message.data;
+          const { id, x, y, vx, vy, facing, limbs, onGround, score } = message.data;
           const existing = remotePlayersRef.current.get(id);
+
+          // Сохраняем очки игрока для расчёта спавна мобов
+          if (score !== undefined) {
+            playerScoresRef.current.set(id, score);
+          }
 
           if (existing) {
             existing.x = x;
@@ -513,7 +520,8 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
         vy: p.vy,
         facing: p.facing,
         onGround: p.onGround,
-        limbs: limbsToSend
+        limbs: limbsToSend,
+        score: stateRef.current.score // Отправляем текущие очки
       },
       timestamp: now
     });
@@ -868,8 +876,28 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     if (legsCount === 1) speedMult *= 0.5;
     if (noLegs) speedMult *= 0.15; // Очень медленно без ног
 
-    if (keys.current['KeyA']) p.vx -= 1.2 * speedMult;
-    if (keys.current['KeyD']) p.vx += 1.2 * speedMult;
+    // Определяем направление движения
+    let moveDir = 0;
+    if (keys.current['KeyA']) moveDir = -1;
+    if (keys.current['KeyD']) moveDir = 1;
+
+    // Плавное ускорение (набирает скорость за 1 секунду)
+    const now = Date.now();
+    if (moveDir !== 0) {
+      if (p.lastMoveDir !== moveDir) {
+        // Направление изменилось или начало движения
+        p.moveStartTime = now;
+        p.lastMoveDir = moveDir;
+      }
+      const moveDuration = now - (p.moveStartTime || now);
+      const accelPercent = Math.min(1, moveDuration / ACCELERATION_TIME);
+      const currentSpeed = PLAYER_SPEED * accelPercent * speedMult;
+      p.vx += moveDir * currentSpeed * 0.2; // Коэффициент ускорения
+    } else {
+      // Движение прекратилось
+      p.lastMoveDir = 0;
+      p.moveStartTime = undefined;
+    }
 
     // Прыжок
     if (keys.current['Space'] && !lastKeys.current['Space'] && p.onGround && legsCount > 0) {
@@ -1036,9 +1064,19 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     // Спавн врагов - локально на каждом клиенте независимо
     // Интенсивность снижена на 25% (было 0.02, стало 0.015)
     // В мультиплеере каждый клиент спавнит врагов самостоятельно для визуализации
+    // Расчитываем среднее очков всех игроков в сессии
+    let avgScore = s.score;
+    if (isMultiplayer) {
+      const allScores = [s.score];
+      remotePlayersRef.current.forEach((player) => {
+        allScores.push(playerScoresRef.current.get(player.id) || 0);
+      });
+      avgScore = allScores.reduce((sum, score) => sum + score, 0) / allScores.length;
+    }
+
     const maxEnemies = gameMode === GameMode.SINGLE_PLAYER
-      ? 5 + Math.floor(s.score / 2000)
-      : 3 + Math.floor(s.score / 3000); // Меньше врагов в мультиплеере для оптимизации
+      ? 5 + Math.floor(avgScore / 2000)
+      : 3 + Math.floor(avgScore / 3000); // Меньше врагов в мультиплеере для оптимизации
 
     if (s.enemies.length < maxEnemies && Math.random() < 0.015) {
       spawnEnemy();
@@ -1166,15 +1204,15 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
             p.stunTimer = 12;
             p.vx += proj.vx * 1.2;
 
-            // 5% шанс оторвать конечность (кроме торса и головы)
+            // 5% шанс оторвать конечность с HP > 0 (можно будет подобрать)
             if ((hitLimb === LimbType.LEFT_ARM || hitLimb === LimbType.RIGHT_ARM ||
                  hitLimb === LimbType.LEFT_LEG || hitLimb === LimbType.RIGHT_LEG) &&
                 Math.random() < 0.05 && limb.hp > 0) {
-              limb.hp = 0;
+              // Сохраняем текущее HP - конечность можно будет подобрать
               limb.exists = false;
               // Цвет в зависимости от типа конечности
               const limbColor = (hitLimb === LimbType.LEFT_ARM || hitLimb === LimbType.RIGHT_ARM) ? COLORS.ARM : COLORS.LEG;
-              detachLimb(hitLimb, p, 'PLAYER', limbColor, true); // destroyed = true
+              detachLimb(hitLimb, p, 'PLAYER', limbColor, false); // destroyed = false - можно подобрать
             } else if (limb.hp <= 0) {
               limb.exists = false;
               if (hitLimb === LimbType.TORSO || hitLimb === LimbType.HEAD) {
@@ -1182,7 +1220,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
                 s.score = Math.floor(s.score / 2);
                 s.gameOver = true;
               } else {
-                // Конечность уничтожена - отрываем её
+                // Конечность уничтожена (HP <= 0) - отрываем её, она исчезнет через 0.5 сек
                 const limbColor = (hitLimb === LimbType.LEFT_ARM || hitLimb === LimbType.RIGHT_ARM) ? COLORS.ARM : COLORS.LEG;
                 detachLimb(hitLimb, p, 'PLAYER', limbColor, true); // destroyed = true
               }

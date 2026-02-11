@@ -48,6 +48,8 @@ export interface Robot extends Entity {
   isJumping: boolean;
   onGround: boolean;
   stunTimer: number; // Frames remaining of movement stun
+  moveStartTime?: number; // Время начала движения для плавного ускорения
+  lastMoveDir?: number; // Последнее направление движения (-1, 0, 1)
 }
 
 export interface Projectile extends Entity {
