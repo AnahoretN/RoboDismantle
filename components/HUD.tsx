@@ -267,48 +267,11 @@ const HUD: React.FC<HUDProps> = ({
         </div>
       )}
 
-      {/* Game Over Overlay */}
-      {gameOver && (
-        <div className="absolute inset-0 bg-red-950/85 pointer-events-auto flex items-center justify-center backdrop-blur-xl">
-          <div className="text-center p-12 border-4 border-red-500/30 rounded-2xl bg-black/40">
-            <h1 className="text-7xl font-black text-white italic tracking-tighter mb-2 animate-pulse">UNIT DESTROYED</h1>
-            <p className="text-xl text-red-400 uppercase tracking-[0.3em] mb-10">Critical Component Failure</p>
-
-            {timer > 0 ? (
-              <div className="text-cyan-400 font-mono text-2xl tracking-[0.5em] mb-4">
-                RE-INITIALIZING IN: {timer}s
-              </div>
-            ) : null}
-
-            <div className="flex gap-4 justify-center">
-              <button
-                disabled={timer > 0}
-                onClick={onRespawn}
-                className={`px-12 py-5 font-bold uppercase tracking-widest transition-all transform hover:scale-105 active:scale-95 shadow-[0_0_30px_rgba(6,182,212,0.5)] ${
-                  timer > 0
-                  ? 'bg-gray-700 text-gray-500 cursor-not-allowed opacity-50'
-                  : 'bg-cyan-500 text-black hover:bg-white'
-                }`}
-              >
-                System Re-Initialize
-              </button>
-
-              <button
-                onClick={() => onBackToMenu?.()}
-                className="px-12 py-5 font-bold uppercase tracking-widest transition-all transform hover:scale-105 active:scale-95 bg-white/10 text-white hover:bg-white/20 border border-white/20 rounded-lg"
-              >
-                Main Menu
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Game End Overlay (Victory Screen) */}
-      {gameEnded && !gameOver && (
+      {/* Game End Overlay (Victory Screen) - показывается когда время вышло */}
+      {gameEnded && (
         <div className="absolute inset-0 bg-black/90 pointer-events-auto flex items-center justify-center backdrop-blur-xl">
           <div className="text-center p-12 border-4 border-yellow-500/30 rounded-2xl bg-black/40 max-w-2xl">
-            <h1 className="text-6xl font-black text-yellow-400 italic tracking-tighter mb-2">GAME COMPLETE</h1>
+            <h1 className="text-6xl font-black text-yellow-400 italic tracking-tighter mb-2">TIME'S UP!</h1>
             <p className="text-xl text-white/80 uppercase tracking-[0.3em] mb-8">Final Rankings</p>
 
             {/* Player Rankings */}
@@ -375,6 +338,43 @@ const HUD: React.FC<HUDProps> = ({
                 className="px-12 py-5 font-bold uppercase tracking-widest transition-all transform hover:scale-105 active:scale-95 shadow-[0_0_30px_rgba(6,182,212,0.5)] bg-cyan-500 text-black hover:bg-white"
               >
                 Play Again
+              </button>
+
+              <button
+                onClick={() => onBackToMenu?.()}
+                className="px-12 py-5 font-bold uppercase tracking-widest transition-all transform hover:scale-105 active:scale-95 bg-white/10 text-white hover:bg-white/20 border border-white/20 rounded-lg"
+              >
+                Main Menu
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Game Over Overlay - только если игра НЕ закончена по таймеру */}
+      {gameOver && !gameEnded && (
+        <div className="absolute inset-0 bg-red-950/85 pointer-events-auto flex items-center justify-center backdrop-blur-xl">
+          <div className="text-center p-12 border-4 border-red-500/30 rounded-2xl bg-black/40">
+            <h1 className="text-7xl font-black text-white italic tracking-tighter mb-2 animate-pulse">UNIT DESTROYED</h1>
+            <p className="text-xl text-red-400 uppercase tracking-[0.3em] mb-10">Critical Component Failure</p>
+
+            {timer > 0 ? (
+              <div className="text-cyan-400 font-mono text-2xl tracking-[0.5em] mb-4">
+                RE-INITIALIZING IN: {timer}s
+              </div>
+            ) : null}
+
+            <div className="flex gap-4 justify-center">
+              <button
+                disabled={timer > 0}
+                onClick={onRespawn}
+                className={`px-12 py-5 font-bold uppercase tracking-widest transition-all transform hover:scale-105 active:scale-95 shadow-[0_0_30px_rgba(6,182,212,0.5)] ${
+                  timer > 0
+                  ? 'bg-gray-700 text-gray-500 cursor-not-allowed opacity-50'
+                  : 'bg-cyan-500 text-black hover:bg-white'
+                }`}
+              >
+                System Re-Initialize
               </button>
 
               <button
