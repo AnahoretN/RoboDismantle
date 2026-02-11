@@ -1,7 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import {
   GameState, Robot, LimbType, Enemy, Platform,
-  Limb, GameMode, RemotePlayer, NetworkMessage
+  Limb, GameMode, RemotePlayer, NetworkMessage, Star
 } from '../types';
 import {
   GRAVITY, FRICTION, PLAYER_JUMP,
@@ -67,6 +67,10 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
   const canvasRect = useRef<DOMRect | null>(null); // Кэш для getBoundingClientRect
   // Интерполяция врагов на клиенте (targetX, targetY, startTime, startX, startY)
   const enemyInterpolationRef = useRef<Map<string, EnemyInterpolation>>(new Map());
+  // Состояние паузы для мультиплеера
+  const [multiplayerPaused, setMultiplayerPaused] = useState<boolean>(false);
+  // Очки удалённых игроков (для экрана победы)
+  const playerScoresRef = useRef<Map<string, number>>(new Map());
 
   // Определяем режим мультиплеера и роль игрока
   const isMultiplayer = gameMode === GameMode.MULTI_PLAYER;
@@ -120,9 +124,25 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       [LimbType.LEFT_LEG]: { type: LimbType.LEFT_LEG, hp: LEG_MAX_HP, maxHp: LEG_MAX_HP, exists: true, damageMultiplier: 1.0 },
       [LimbType.RIGHT_LEG]: { type: LimbType.RIGHT_LEG, hp: LEG_MAX_HP, maxHp: LEG_MAX_HP, exists: true, damageMultiplier: 1.0 },
     },
-    leftWeapon: { name: 'Plasma', type: 'PROJECTILE', cooldown: 200, lastFired: 0, color: '#00f2ff' },
-    rightWeapon: { name: 'Laser', type: 'PROJECTILE', cooldown: 150, lastFired: 0, color: '#ffea00' },
+    leftWeapon: { name: 'Plasma', type: 'PROJECTILE', cooldown: 200, lastFired: 0, color: COLORS.ARM },
+    rightWeapon: { name: 'Laser', type: 'PROJECTILE', cooldown: 150, lastFired: 0, color: COLORS.ARM },
   });
+
+  // Find top platform for star spawn
+  const getTopPlatform = () => {
+    return basePlatforms.reduce((top, plat) =>
+      plat.y < top.y ? plat : top
+    );
+  };
+
+  const getInitialStar = (): Star => {
+    const topPlatform = getTopPlatform();
+    return {
+      x: topPlatform.x + topPlatform.width / 2 - 10,
+      y: topPlatform.y - 30,
+      collected: false
+    };
+  };
 
   const stateRef = useRef<GameState>({
     player: getDefaultPlayerState(),
@@ -133,6 +153,11 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     camera: { x: 0, y: 0 },
     score: 0,
     gameOver: false,
+    detachedLimbs: [],
+    star: getInitialStar(),
+    gameStartTime: Date.now(),
+    gameDuration: 300000, // 5 minutes in ms
+    gameEnded: false
   });
 
   const [hudState, setHudState] = useState<GameState>(stateRef.current);
@@ -194,7 +219,16 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
           break;
         }
 
-        case 'PLAYER_DIED':
+        case 'PLAYER_DIED': {
+          const { id, score: deadScore } = message.data;
+          // Track score for victory screen
+          if (deadScore !== undefined) {
+            playerScoresRef.current.set(id, deadScore);
+          }
+          remotePlayersRef.current.delete(id);
+          break;
+        }
+
         case 'PLAYER_DISCONNECTED': {
           const { id } = message.data;
           remotePlayersRef.current.delete(id);
@@ -218,6 +252,9 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
         }
 
         case 'PAUSE_TOGGLE': {
+          // Синхронизация паузы в мультиплеере
+          const { paused } = message.data;
+          setMultiplayerPaused(paused);
           break;
         }
 
@@ -228,6 +265,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
             const limb = s.player.limbs[limbKey as LimbType];
             if (limb && limb.exists) {
               limb.hp -= damage;
+              limb.damageFlashTimer = 10; // Мигание 10 кадров
               s.player.stunTimer = 12;
               if (limb.hp <= 0) {
                 limb.exists = false;
@@ -235,6 +273,55 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
                   s.gameOver = true;
                 }
               }
+            }
+          }
+          break;
+        }
+
+        case 'LIMB_DETACHED': {
+          // Удалённый игрок потерял конечность
+          const { playerId, limbType, x, y, vx, vy, color, hp, maxHp, destroyed } = message.data;
+          const target = remotePlayersRef.current.get(playerId);
+          if (target) {
+            target.limbs[limbType as LimbType].exists = false;
+            // Создаём оторванную конечность
+            s.detachedLimbs.push({
+              limbType: limbType as LimbType,
+              x, y, vx, vy,
+              width: limbType.includes('ARM') ? 28 : 25,
+              height: limbType.includes('ARM') ? 12 : 10,
+              color,
+              rotation: 0,
+              rotationSpeed: (Math.random() - 0.5) * 0.3,
+              owner: 'REMOTE_PLAYER',
+              ownerId: playerId,
+              hp: hp || 50,
+              maxHp: maxHp || (limbType.includes('ARM') ? 50 : 75),
+              destroyed: destroyed || false
+            });
+          }
+          break;
+        }
+
+        case 'LIMB_ATTACHED': {
+          // Кто-то подобрал конечность
+          const { playerId, limbType, side, hp, maxHp } = message.data;
+          if (playerId === localPlayerId) {
+            // Присоединяем к локальному игроку
+            const targetLimb = side === 'left' ? LimbType.LEFT_ARM : LimbType.RIGHT_ARM;
+            const limb = s.player.limbs[targetLimb];
+            limb.exists = true;
+            limb.hp = hp;
+            limb.maxHp = maxHp;
+          } else {
+            // Присоединяем к удалённому игроку
+            const target = remotePlayersRef.current.get(playerId);
+            if (target) {
+              const targetLimb = side === 'left' ? LimbType.LEFT_ARM : LimbType.RIGHT_ARM;
+              const limb = target.limbs[targetLimb];
+              limb.exists = true;
+              limb.hp = hp;
+              limb.maxHp = maxHp;
             }
           }
           break;
@@ -251,8 +338,12 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
           s.enemies = [];
           s.projectiles = [];
           s.vfx = [];
+          s.detachedLimbs = [];
           s.score = 0;
           s.gameOver = false;
+          s.gameEnded = false;
+          s.gameStartTime = Date.now();
+          s.star = getInitialStar();
           s.camera = { x: spawnX - window.innerWidth / 2, y: spawnY - window.innerHeight / 2 };
           setHudState({ ...s });
           break;
@@ -310,6 +401,20 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
               if (!receivedIds.has(id)) interpolationMap.delete(id);
             });
           }
+          break;
+        }
+
+        case 'STAR_COLLECTED': {
+          // Another player collected the star
+          const { score: newScore } = message.data;
+          s.star.collected = true;
+          s.star.respawnTime = Date.now() + 20000 + Math.random() * 10000;
+          break;
+        }
+
+        case 'GAME_END': {
+          // Game ended - show results
+          s.gameEnded = true;
           break;
         }
       }
@@ -455,27 +560,334 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     });
   }, [webrtcManager]);
 
+  // Функция для проверки попадания в конкретную конечность
+  const checkLimbHit = (
+    projX: number, projY: number,
+    robot: Robot | RemotePlayer,
+    isLocal: boolean
+  ): LimbType | null => {
+    const centerX = robot.x + robot.width / 2;
+    const centerY = robot.y + robot.height / 2 - 5;
+    const hipY = centerY + 10;
+    const isCrouching = isLocal ? (keys.current['KeyS'] || keys.current['ArrowDown']) : false;
+    const crouchOff = isCrouching ? robot.height * 0.2 : 0;
+    const headOff = isCrouching ? 8 : 0;
+    const noLegs = !robot.limbs.LEFT_LEG.exists && !robot.limbs.RIGHT_LEG.exists;
+    const leglessOffset = noLegs ? 15 : 0;
+
+    // Hitbox-ы конечностей
+    const hitboxes: { limb: LimbType; x: number; y: number; w: number; h: number }[] = [];
+
+    // Ноги
+    if (robot.limbs[LimbType.LEFT_LEG].exists) {
+      const time = Date.now() / 120;
+      const walk = Math.abs(robot.vx) > 0.5 ? Math.sin(time) * 0.6 : 0;
+      const jump = (robot as any).onGround === false ? (robot.vy < 0 ? -0.4 : 0.4) : 0;
+      const legAngle = Math.PI / 2 + walk + jump;
+      const legEndX = centerX - 8 + Math.cos(legAngle) * 25;
+      const legEndY = hipY + leglessOffset + Math.sin(legAngle) * 25;
+      hitboxes.push({
+        limb: LimbType.LEFT_LEG,
+        x: Math.min(centerX - 8, legEndX) - 5,
+        y: Math.min(hipY + leglessOffset, legEndY) - 5,
+        w: Math.abs(legEndX - (centerX - 8)) + 10,
+        h: Math.abs(legEndY - (hipY + leglessOffset)) + 10
+      });
+    }
+
+    if (robot.limbs[LimbType.RIGHT_LEG].exists) {
+      const time = Date.now() / 120;
+      const walk = Math.abs(robot.vx) > 0.5 ? Math.sin(time) * 0.6 : 0;
+      const jump = (robot as any).onGround === false ? (robot.vy < 0 ? -0.4 : 0.4) : 0;
+      const legAngle = Math.PI / 2 - walk + jump;
+      const legEndX = centerX + 8 + Math.cos(legAngle) * 25;
+      const legEndY = hipY + leglessOffset + Math.sin(legAngle) * 25;
+      hitboxes.push({
+        limb: LimbType.RIGHT_LEG,
+        x: Math.min(centerX + 8, legEndX) - 5,
+        y: Math.min(hipY + leglessOffset, legEndY) - 5,
+        w: Math.abs(legEndX - (centerX + 8)) + 10,
+        h: Math.abs(legEndY - (hipY + leglessOffset)) + 10
+      });
+    }
+
+    // Руки (когда нет ног, руки тоже ниже)
+    const armOffsetY = noLegs ? leglessOffset * 0.3 : 0;
+    if (robot.limbs[LimbType.LEFT_ARM].exists) {
+      const armEndX = centerX - 15 + Math.cos(robot.facing) * 28;
+      const armEndY = centerY - 7 + armOffsetY + Math.sin(robot.facing) * 28;
+      hitboxes.push({
+        limb: LimbType.LEFT_ARM,
+        x: Math.min(centerX - 15, armEndX) - 6,
+        y: Math.min(centerY - 7 + armOffsetY, armEndY) - 6,
+        w: Math.abs(armEndX - (centerX - 15)) + 12,
+        h: Math.abs(armEndY - (centerY - 7 + armOffsetY)) + 12
+      });
+    }
+
+    if (robot.limbs[LimbType.RIGHT_ARM].exists) {
+      const armEndX = centerX + 15 + Math.cos(robot.facing) * 28;
+      const armEndY = centerY - 7 + armOffsetY + Math.sin(robot.facing) * 28;
+      hitboxes.push({
+        limb: LimbType.RIGHT_ARM,
+        x: Math.min(centerX + 15, armEndX) - 6,
+        y: Math.min(centerY - 7 + armOffsetY, armEndY) - 6,
+        w: Math.abs(armEndX - (centerX + 15)) + 12,
+        h: Math.abs(armEndY - (centerY - 7 + armOffsetY)) + 12
+      });
+    }
+
+    // Проверяем попадание в hitbox (в порядке: конечности, потом тело)
+    for (const hb of hitboxes) {
+      if (projX >= hb.x && projX <= hb.x + hb.w &&
+          projY >= hb.y && projY <= hb.y + hb.h) {
+        return hb.limb;
+      }
+    }
+
+    // Если не попали в конечности, проверяем торс и голову
+    // Когда нет ног, торс и голова тоже ниже
+    const bodyOffsetY = noLegs ? leglessOffset : 0;
+    if (robot.limbs[LimbType.TORSO].exists) {
+      const torsoX = centerX - 18;
+      const torsoY = centerY - 18 + crouchOff + bodyOffsetY;
+      if (projX >= torsoX && projX <= torsoX + 36 &&
+          projY >= torsoY && projY <= torsoY + 36) {
+        return LimbType.TORSO;
+      }
+    }
+
+    if (robot.limbs[LimbType.HEAD].exists) {
+      const headY = centerY - 32 + headOff + bodyOffsetY;
+      if (projX >= centerX - 10 && projX <= centerX + 10 &&
+          projY >= headY && projY <= headY + 16) {
+        return LimbType.HEAD;
+      }
+    }
+
+    return null;
+  };
+
+  // Функция для создания оторванной конечности
+  const detachLimb = (
+    limbType: LimbType,
+    robot: Robot | RemotePlayer,
+    owner: 'PLAYER' | 'REMOTE_PLAYER',
+    color: string,
+    destroyed: boolean = false
+  ) => {
+    const s = stateRef.current;
+    const centerX = robot.x + robot.width / 2;
+    const centerY = robot.y + robot.height / 2 - 5;
+    const limb = robot.limbs[limbType];
+
+    s.detachedLimbs.push({
+      limbType,
+      x: centerX,
+      y: centerY - 10,
+      vx: (Math.random() - 0.5) * 5,
+      vy: -3 - Math.random() * 3,
+      width: limbType.includes('ARM') ? 28 : 25,
+      height: limbType.includes('ARM') ? 12 : 10,
+      color,
+      rotation: 0,
+      rotationSpeed: (Math.random() - 0.5) * 0.3,
+      owner,
+      ownerId: owner === 'REMOTE_PLAYER' ? (robot as RemotePlayer).id : undefined,
+      hp: Math.max(0, limb.hp),
+      maxHp: limb.maxHp,
+      destroyed, // Если true - конечность сломана
+      destroyTime: destroyed ? Date.now() + 500 : undefined // Исчезнет через 0.5 секунды
+    });
+
+    // Эффект вспышки при уничтожении
+    if (destroyed) {
+      spawnVFX(centerX, centerY - 10, '#ffffff', 30);
+    }
+
+    // Отправляем сообщение о detachment в мультиплеере
+    if (owner === 'PLAYER' && webrtcManager?.isConnected()) {
+      webrtcManager.send({
+        type: 'LIMB_DETACHED',
+        playerId: localPlayerId,
+        data: {
+          limbType,
+          x: centerX,
+          y: centerY - 10,
+          vx: (Math.random() - 0.5) * 5,
+          vy: -3 - Math.random() * 3,
+          color,
+          hp: Math.max(0, limb.hp),
+          maxHp: limb.maxHp,
+          destroyed
+        },
+        timestamp: Date.now()
+      });
+    }
+  };
+
+  // Функция для подбора конечности
+  const tryPickupLimb = (side: 'left' | 'right') => {
+    const s = stateRef.current;
+    const p = s.player;
+    const centerX = p.x + p.width / 2;
+    const centerY = p.y + p.height / 2;
+
+    // Ищем ближайшую конечность на полу
+    for (let i = s.detachedLimbs.length - 1; i >= 0; i--) {
+      const limb = s.detachedLimbs[i];
+      const limbCenterX = limb.x + limb.width / 2;
+      const limbCenterY = limb.y + limb.height / 2;
+      const dist = Math.sqrt((centerX - limbCenterX) ** 2 + (centerY - limbCenterY) ** 2);
+
+      // Если рядом (в радиусе 80 пикселей)
+      if (dist < 80) {
+        // Сломанные конечности нельзя подобрать
+        if (limb.destroyed) {
+          // Показываем что нельзя подобрать (можно добавить звук или визуальный эффект)
+          spawnVFX(limbCenterX, limbCenterY, '#ff4444', 10); // Красная вспышка
+          return;
+        }
+
+        // Определяем тип конечности (рука или нога) и сторону
+        const isArm = limb.limbType.includes('ARM');
+        let targetLimb: LimbType;
+
+        if (isArm) {
+          targetLimb = side === 'left' ? LimbType.LEFT_ARM : LimbType.RIGHT_ARM;
+        } else {
+          targetLimb = side === 'left' ? LimbType.LEFT_LEG : LimbType.RIGHT_LEG;
+        }
+
+        // Заменяем конечность
+        p.limbs[targetLimb].exists = true;
+        p.limbs[targetLimb].hp = limb.hp;
+        p.limbs[targetLimb].maxHp = limb.maxHp;
+
+        // Удаляем из списка оторванных
+        s.detachedLimbs.splice(i, 1);
+
+        // Отправляем сообщение в мультиплеере
+        if (webrtcManager?.isConnected()) {
+          webrtcManager.send({
+            type: 'LIMB_ATTACHED',
+            playerId: localPlayerId,
+            data: {
+              limbType: targetLimb,
+              side,
+              hp: limb.hp,
+              maxHp: limb.maxHp
+            },
+            timestamp: Date.now()
+          });
+        }
+
+        // VFX эффект
+        spawnVFX(limbCenterX, limbCenterY, '#ffffff', 20);
+        return; // Только одну конечность за клик
+      }
+    }
+  };
+
+  // Функция для выпадения конечности из убитого врага
+  const spawnLimbFromEnemy = (enemyX: number, enemyY: number, enemyWidth: number, enemyHeight: number) => {
+    const s = stateRef.current;
+    // 5% шанс выпадения
+    if (Math.random() >= 0.05) return;
+
+    // Случайно выбираем тип конечности (рука или нога)
+    const isArm = Math.random() < 0.5;
+    // Универсальные конечности - используем типы для левой стороны, но при подборе игрок решает куда прикрепить
+    const limbType = isArm ? LimbType.LEFT_ARM : LimbType.LEFT_LEG;
+
+    // HP конечности 100%
+    const maxHp = isArm ? ARM_MAX_HP : LEG_MAX_HP;
+
+    s.detachedLimbs.push({
+      limbType,
+      x: enemyX + enemyWidth / 2,
+      y: enemyY + enemyHeight / 2,
+      vx: (Math.random() - 0.5) * 4,
+      vy: -2 - Math.random() * 2,
+      width: isArm ? 28 : 25,
+      height: isArm ? 12 : 10,
+      color: isArm ? COLORS.ARM : COLORS.LEG, // Жёлтые руки, синие ноги
+      rotation: 0,
+      rotationSpeed: (Math.random() - 0.5) * 0.2,
+      owner: 'PLAYER',
+      hp: maxHp,
+      maxHp: maxHp
+    });
+  };
+
+  // Функция для спавна звезды на случайной платформе
+  const respawnStar = () => {
+    const s = stateRef.current;
+    const randomPlatform = basePlatforms[Math.floor(Math.random() * basePlatforms.length)];
+    s.star = {
+      x: randomPlatform.x + randomPlatform.width / 2 - 10,
+      y: randomPlatform.y - 30,
+      collected: false
+    };
+  };
+
   const update = () => {
     const s = stateRef.current;
 
-    if (isPaused || s.gameOver) return;
+    // Check game timer
+    if (!s.gameEnded && s.gameStartTime) {
+      const elapsed = Date.now() - s.gameStartTime;
+      if (elapsed >= s.gameDuration) {
+        s.gameEnded = true;
+        // Send game end message in multiplayer
+        if (webrtcManager?.isConnected()) {
+          webrtcManager.send({
+            type: 'GAME_END',
+            playerId: localPlayerId,
+            data: { score: s.score },
+            timestamp: Date.now()
+          });
+        }
+      }
+    }
+
+    // Пауза полностью останавливает игру
+    const isGamePaused = isPaused || globalPaused || multiplayerPaused;
+    if (isGamePaused || s.gameOver || s.gameEnded) {
+      return; // Ничего не обновляем когда игра на паузе
+    }
 
     const p = s.player;
     if (p.stunTimer > 0) p.stunTimer--;
     const isCrouching = keys.current['KeyS'] || keys.current['ArrowDown'];
     const stunSpeedFactor = p.stunTimer > 0 ? 0.5 : 1.0;
-    let speedMult = (isCrouching ? 0.4 : 1.0) * stunSpeedFactor;
     const legsCount = [p.limbs.LEFT_LEG.exists, p.limbs.RIGHT_LEG.exists].filter(Boolean).length;
+    const noLegs = legsCount === 0;
+
+    let speedMult = (isCrouching ? 0.4 : 1.0) * stunSpeedFactor;
     if (legsCount === 1) speedMult *= 0.5;
-    if (legsCount === 0) speedMult *= 0.2;
+    if (noLegs) speedMult *= 0.15; // Очень медленно без ног
+
     if (keys.current['KeyA']) p.vx -= 1.2 * speedMult;
     if (keys.current['KeyD']) p.vx += 1.2 * speedMult;
+
+    // Прыжок
     if (keys.current['Space'] && !lastKeys.current['Space'] && p.onGround && legsCount > 0) {
       p.vy = PLAYER_JUMP * (p.stunTimer > 0 ? 0.8 : 1.0);
       p.onGround = false;
     }
     // Оптимизация: отслеживаем только пробел для прыжка
     lastKeys.current['Space'] = keys.current['Space'];
+
+    // Автоматические маленькие прыжки когда нет ног
+    if (noLegs && p.onGround && Math.abs(p.vx) > 0.3) {
+      // Маленький подпрыгивание при движении (увеличено в 2 раза)
+      if (Math.random() < 0.1) {
+        p.vy = -6; // Было -3, теперь -6
+        p.onGround = false;
+      }
+    }
+
     p.vx *= FRICTION;
     p.vy += GRAVITY;
     p.x += p.vx;
@@ -483,6 +895,8 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
 
     // Death void
     if (p.y > 1500) {
+      // Lose half score on death
+      s.score = Math.floor(s.score / 2);
       s.gameOver = true;
       p.limbs[LimbType.TORSO].hp = 0;
       p.limbs[LimbType.TORSO].exists = false;
@@ -492,7 +906,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
         webrtcManager.send({
           type: 'PLAYER_DIED',
           playerId: realPlayerId,
-          data: { id: realPlayerId },
+          data: { id: realPlayerId, score: s.score },
           timestamp: Date.now()
         });
       }
@@ -501,12 +915,53 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     p.onGround = false;
     s.platforms.forEach((plat: Platform) => {
       if (p.x + p.width > plat.x && p.x < plat.x + plat.width) {
-        const feetPos = p.y + p.height;
+        // Когда нет ног, используем нижнюю часть туловища для коллизии
+        const feetPos = noLegs ? p.y + p.height * 0.6 : p.y + p.height;
+        const playerHeight = noLegs ? p.height * 0.6 : p.height;
         if (feetPos >= plat.y && feetPos <= plat.y + plat.height + Math.max(0, p.vy) + 1) {
-          if (p.vy >= 0) { p.y = plat.y - p.height; p.vy = 0; p.onGround = true; }
+          if (p.vy >= 0) {
+            p.y = plat.y - playerHeight;
+            p.vy = 0;
+            p.onGround = true;
+          }
         }
       }
     });
+
+    // Star collection
+    if (!s.star.collected) {
+      const starCenterX = s.star.x + 10;
+      const starCenterY = s.star.y + 10;
+      const playerCenterX = p.x + p.width / 2;
+      const playerCenterY = p.y + p.height / 2;
+      const dist = Math.sqrt((starCenterX - playerCenterX) ** 2 + (starCenterY - playerCenterY) ** 2);
+
+      if (dist < 40) {
+        // Double the score
+        s.score *= 2;
+        s.star.collected = true;
+        // Respawn in 20-30 seconds
+        s.star.respawnTime = Date.now() + 20000 + Math.random() * 10000;
+        // VFX effect
+        spawnVFX(starCenterX, starCenterY, '#ffdd00', 40);
+        spawnVFX(starCenterX, starCenterY, '#ffffff', 30);
+
+        // Send star collected message in multiplayer
+        if (webrtcManager?.isConnected()) {
+          webrtcManager.send({
+            type: 'STAR_COLLECTED',
+            playerId: localPlayerId,
+            data: { score: s.score },
+            timestamp: Date.now()
+          });
+        }
+      }
+    } else {
+      // Check if it's time to respawn the star
+      if (s.star.respawnTime && Date.now() >= s.star.respawnTime) {
+        respawnStar();
+      }
+    }
 
     // Прыжок на врагов
     if (p.vy > 0 && legsCount > 0) {
@@ -518,6 +973,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
           e.hp -= 20;
           spawnVFX(p.x + p.width / 2, p.y + p.height, '#ffffff', 30);
           if (e.hp <= 0) {
+            spawnLimbFromEnemy(e.x, e.y, e.width, e.height); // 5% шанс внутри функции
             s.enemies.splice(i, 1);
             s.score += 250;
           }
@@ -692,12 +1148,13 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       if (Math.abs(proj.x - p.x) > 2000) return false;
 
       if (proj.owner === 'ENEMY') {
-        if (proj.x > p.x && proj.x < p.x + p.width && proj.y > p.y && proj.y < p.y + p.height) {
-          const limbKey = proj.targetLimb || LimbType.TORSO;
-          const limb = p.limbs[limbKey];
+        // Проверяем попадание в игрока с учётом hitbox-ов конечностей
+        const hitLimb = checkLimbHit(proj.x, proj.y, p, true);
+        if (hitLimb) {
+          const limb = p.limbs[hitLimb];
           if (limb.exists) {
             let finalDamage = proj.damage * (limb.damageMultiplier || 1.0);
-            if (limbKey === LimbType.TORSO || limbKey === LimbType.HEAD) {
+            if (hitLimb === LimbType.TORSO || hitLimb === LimbType.HEAD) {
               const activeLimbs = [LimbType.LEFT_ARM, LimbType.RIGHT_ARM, LimbType.LEFT_LEG, LimbType.RIGHT_LEG].filter(t => p.limbs[t].exists).length;
               finalDamage *= (1 - activeLimbs * 0.15);
               spawnVFX(proj.x, proj.y, COLORS.PLAYER, 12);
@@ -705,12 +1162,29 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
               spawnVFX(proj.x, proj.y, proj.color, 8);
             }
             limb.hp -= finalDamage;
+            limb.damageFlashTimer = 10; // Мигание красным
             p.stunTimer = 12;
             p.vx += proj.vx * 1.2;
-            if (limb.hp <= 0) {
+
+            // 5% шанс оторвать конечность (кроме торса и головы)
+            if ((hitLimb === LimbType.LEFT_ARM || hitLimb === LimbType.RIGHT_ARM ||
+                 hitLimb === LimbType.LEFT_LEG || hitLimb === LimbType.RIGHT_LEG) &&
+                Math.random() < 0.05 && limb.hp > 0) {
+              limb.hp = 0;
               limb.exists = false;
-              if (limbKey === LimbType.TORSO || limbKey === LimbType.HEAD) {
+              // Цвет в зависимости от типа конечности
+              const limbColor = (hitLimb === LimbType.LEFT_ARM || hitLimb === LimbType.RIGHT_ARM) ? COLORS.ARM : COLORS.LEG;
+              detachLimb(hitLimb, p, 'PLAYER', limbColor, true); // destroyed = true
+            } else if (limb.hp <= 0) {
+              limb.exists = false;
+              if (hitLimb === LimbType.TORSO || hitLimb === LimbType.HEAD) {
+                // Lose half score on death
+                s.score = Math.floor(s.score / 2);
                 s.gameOver = true;
+              } else {
+                // Конечность уничтожена - отрываем её
+                const limbColor = (hitLimb === LimbType.LEFT_ARM || hitLimb === LimbType.RIGHT_ARM) ? COLORS.ARM : COLORS.LEG;
+                detachLimb(hitLimb, p, 'PLAYER', limbColor, true); // destroyed = true
               }
             }
           }
@@ -724,6 +1198,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
             e.hp -= proj.damage;
             spawnVFX(proj.x, proj.y, proj.color, 20);
             if (e.hp <= 0) {
+              spawnLimbFromEnemy(e.x, e.y, e.width, e.height); // 5% шанс внутри функции
               s.enemies.splice(i, 1);
               s.score += 150;
             }
@@ -740,30 +1215,28 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
               ownerId = localPlayerId;
             } else if (proj.owner === 'REMOTE_PLAYER') {
               ownerId = (proj as any).ownerId;
-              if (!ownerId) continue; // Нет ID - пропускаем
+              if (!ownerId) continue;
             } else {
               continue;
             }
 
-            // Пропускаем если пуля принадлежит этому игроку (нельзя себя ранить)
+            // Пропускаем если пуля принадлежит этому игроку
             if (ownerId === id) continue;
 
-            // Проверка попадания
-            if (proj.x > target.x && proj.x < target.x + target.width &&
-                proj.y > target.y && proj.y < target.y + target.height) {
-              // Выбираем случайную конечность для попадания
-              const limbs = Object.entries(target.limbs).filter(([_, l]: [string, any]) => l.exists);
-              if (limbs.length > 0) {
-                const [limbKey, limb] = limbs[Math.floor(Math.random() * limbs.length)] as [LimbType, Limb];
-
+            // Проверяем попадание с учётом hitbox-ов
+            const hitLimb = checkLimbHit(proj.x, proj.y, target, false);
+            if (hitLimb) {
+              const limb = target.limbs[hitLimb];
+              if (limb.exists) {
                 let finalDamage = proj.damage * (limb.damageMultiplier || 1.0);
-                if (limbKey === LimbType.TORSO || limbKey === LimbType.HEAD) {
+                if (hitLimb === LimbType.TORSO || hitLimb === LimbType.HEAD) {
                   const activeLimbs = [LimbType.LEFT_ARM, LimbType.RIGHT_ARM, LimbType.LEFT_LEG, LimbType.RIGHT_LEG]
                     .filter(t => target.limbs[t].exists).length;
                   finalDamage *= (1 - activeLimbs * 0.15);
                 }
 
                 limb.hp -= finalDamage;
+                limb.damageFlashTimer = 10;
 
                 // Отправляем сообщение о повреждении
                 if (proj.owner === 'PLAYER' && webrtcManager?.isConnected()) {
@@ -772,7 +1245,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
                     playerId: localPlayerId,
                     data: {
                       targetId: id,
-                      limbKey,
+                      limbKey: hitLimb,
                       damage: finalDamage
                     },
                     timestamp: Date.now()
@@ -791,6 +1264,39 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     });
 
     s.vfx = s.vfx.filter((v) => { v.life--; return v.life > 0; });
+
+    // Обновление оторванных конечностей
+    s.detachedLimbs = s.detachedLimbs.filter((limb) => {
+      limb.vy += GRAVITY * 0.5;
+      limb.x += limb.vx;
+      limb.y += limb.vy;
+      limb.rotation += limb.rotationSpeed;
+      limb.vx *= 0.98;
+
+      // Проверка столкновения с платформами
+      let onPlatform = false;
+      for (const plat of s.platforms) {
+        if (limb.x + limb.width > plat.x && limb.x < plat.x + plat.width) {
+          if (limb.y + limb.height >= plat.y && limb.y + limb.height <= plat.y + plat.height + limb.vy + 1) {
+            if (limb.vy > 0) {
+              limb.y = plat.y - limb.height;
+              limb.vy = -limb.vy * 0.3;
+              limb.vx *= 0.7;
+              limb.rotationSpeed *= 0.5;
+              onPlatform = true;
+            }
+          }
+        }
+      }
+
+      // Удаляем если улетели далеко вниз или если сломанная конечность должна исчезнуть
+      if (limb.destroyed && limb.destroyTime && Date.now() >= limb.destroyTime) {
+        // Эффект исчезновения
+        spawnVFX(limb.x + limb.width / 2, limb.y + limb.height / 2, limb.color, 15);
+        return false;
+      }
+      return limb.y < 2000;
+    });
 
     // Обновление камеры
     const canvas = canvasRef.current;
@@ -821,6 +1327,14 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
 
     const drawLimb = (type: LimbType, px: number, py: number, lw: number, lh: number, ang: number, col: string) => {
       if (!p.limbs[type].exists) return;
+      const limb = p.limbs[type];
+      // Мигание красным при получении урона
+      const flashTimer = (limb as any).damageFlashTimer || 0;
+      const shouldFlash = flashTimer > 0;
+      if (shouldFlash && typeof limb.damageFlashTimer === 'number') {
+        limb.damageFlashTimer--;
+      }
+
       ctx.save();
       ctx.translate(px, py);
       if (type.includes('ARM')) {
@@ -832,7 +1346,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
         ctx.fill();
       }
       ctx.rotate(ang);
-      ctx.fillStyle = (p as any).stunTimer > 0 ? '#ff4444' : col;
+      ctx.fillStyle = shouldFlash ? '#ff4444' : col;
       ctx.beginPath();
       ctx.roundRect(0, -lh / 2, lw, lh, 6);
       ctx.fill();
@@ -843,22 +1357,30 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     const walk = Math.abs(p.vx) > 0.5 ? Math.sin(time) * 0.6 : 0;
     const onGround = (p as any).onGround ?? true;
     const jump = !onGround ? (p.vy < 0 ? -0.4 : 0.4) : 0;
+    const noLegs = !p.limbs.LEFT_LEG.exists && !p.limbs.RIGHT_LEG.exists;
+
+    // Когда нет ног, опускаем тело ниже
+    const leglessOffset = noLegs ? 15 : 0;
 
     // Рисуем ноги
-    drawLimb(LimbType.LEFT_LEG, centerX - 8, hipY, 25, 10, Math.PI / 2 + walk + jump, color);
-    drawLimb(LimbType.RIGHT_LEG, centerX + 8, hipY, 25, 10, Math.PI / 2 - walk + jump, color);
+    drawLimb(LimbType.LEFT_LEG, centerX - 8, hipY + leglessOffset, 25, 10, Math.PI / 2 + walk + jump, color);
+    drawLimb(LimbType.RIGHT_LEG, centerX + 8, hipY + leglessOffset, 25, 10, Math.PI / 2 - walk + jump, color);
 
     ctx.save();
-    ctx.translate(centerX, hipY);
+    ctx.translate(centerX, hipY + leglessOffset);
     if (!p.limbs.LEFT_LEG.exists && p.limbs.RIGHT_LEG.exists) ctx.rotate(-0.15);
     else if (p.limbs.LEFT_LEG.exists && !p.limbs.RIGHT_LEG.exists) ctx.rotate(0.15);
-    ctx.translate(-centerX, -hipY + crouchOff);
+    ctx.translate(-centerX, -hipY - leglessOffset + crouchOff);
 
     // Торс
     if (p.limbs[LimbType.TORSO].exists) {
+      const torsoFlash = (p.limbs[LimbType.TORSO] as any).damageFlashTimer || 0;
+      if (typeof p.limbs[LimbType.TORSO].damageFlashTimer === 'number' && torsoFlash > 0) {
+        p.limbs[LimbType.TORSO].damageFlashTimer--;
+      }
       ctx.shadowBlur = 15;
       ctx.shadowColor = color;
-      ctx.fillStyle = (p as any).stunTimer > 0 ? '#ff4444' : color;
+      ctx.fillStyle = torsoFlash > 0 ? '#ff4444' : color;
       ctx.beginPath();
       ctx.arc(centerX, centerY, 18, 0, Math.PI * 2);
       ctx.fill();
@@ -866,12 +1388,16 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
 
     // Голова
     if (p.limbs[LimbType.HEAD].exists) {
+      const headFlash = (p.limbs[LimbType.HEAD] as any).damageFlashTimer || 0;
+      if (typeof p.limbs[LimbType.HEAD].damageFlashTimer === 'number' && headFlash > 0) {
+        p.limbs[LimbType.HEAD].damageFlashTimer--;
+      }
       const hY = centerY - 32 + headOff;
       ctx.save();
       ctx.translate(centerX, hY + 16);
       if (isCrouching && isLocal) ctx.rotate(0.1);
       ctx.translate(-centerX, -(hY + 16));
-      ctx.fillStyle = (p as any).stunTimer > 0 ? '#ff4444' : color;
+      ctx.fillStyle = headFlash > 0 ? '#ff4444' : color;
       ctx.beginPath();
       ctx.roundRect(centerX - 10, hY, 20, 16, 8);
       ctx.fill();
@@ -947,6 +1473,82 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       ctx.restore();
     });
 
+    // Оторванные конечности
+    const playerCenterX = p.x + p.width / 2;
+    const playerCenterY = p.y + p.height / 2;
+
+    s.detachedLimbs.forEach((limb) => {
+      ctx.save();
+      ctx.translate(limb.x + limb.width / 2, limb.y + limb.height / 2);
+      ctx.rotate(limb.rotation);
+
+      // Сломанные конечности темнее и полупрозрачные
+      if (limb.destroyed) {
+        ctx.fillStyle = limb.color + '66'; // Добавляем прозрачность
+        ctx.globalAlpha = 0.6;
+      } else {
+        ctx.fillStyle = limb.color;
+        ctx.globalAlpha = 1.0;
+      }
+
+      ctx.shadowBlur = 10;
+      ctx.shadowColor = limb.color;
+      ctx.beginPath();
+      ctx.roundRect(-limb.width / 2, -limb.height / 2, limb.width, limb.height, 6);
+      ctx.fill();
+      ctx.restore();
+
+      // Белый кружок над конечностью если игрок рядом (и она не сломана)
+      const limbCenterX = limb.x + limb.width / 2;
+      const limbCenterY = limb.y + limb.height / 2;
+      const dist = Math.sqrt((playerCenterX - limbCenterX) ** 2 + (playerCenterY - limbCenterY) ** 2);
+      if (dist < 80 && !limb.destroyed) {
+        ctx.save();
+        ctx.translate(limbCenterX, limb.y - 15);
+        // Пульсирующий кружок
+        const pulse = Math.sin(Date.now() / 200) * 3;
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(0, 0, 8 + pulse, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+    });
+
+    // Star
+    if (!s.star.collected) {
+      const starCenterX = s.star.x + 10;
+      const starCenterY = s.star.y + 10;
+      const pulse = Math.sin(Date.now() / 150) * 2;
+
+      ctx.save();
+      ctx.translate(starCenterX, starCenterY);
+      ctx.rotate(Date.now() / 1000);
+
+      // Glow effect
+      ctx.shadowBlur = 20 + pulse;
+      ctx.shadowColor = '#ffdd00';
+
+      // Draw star shape
+      ctx.fillStyle = '#ffdd00';
+      ctx.beginPath();
+      for (let i = 0; i < 5; i++) {
+        const angle = (i * 4 * Math.PI) / 5 - Math.PI / 2;
+        const radius = 15 + pulse;
+        const x = Math.cos(angle) * radius;
+        const y = Math.sin(angle) * radius;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.restore();
+    }
+
     // Снаряды
     s.projectiles.forEach((pr) => {
       ctx.fillStyle = pr.color;
@@ -975,13 +1577,24 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.code === 'Escape' || (e.code === 'KeyP' && !e.repeat)) {
+        const newPausedState = !isPaused;
         onPauseToggle();
+
+        // Отправляем сообщение о паузе в мультиплеере
+        if (isMultiplayer && webrtcManager?.isConnected()) {
+          webrtcManager.send({
+            type: 'PAUSE_TOGGLE',
+            playerId: localPlayerId,
+            data: { paused: newPausedState },
+            timestamp: Date.now()
+          });
+        }
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onPauseToggle]);
+  }, [onPauseToggle, isPaused, isMultiplayer, webrtcManager, localPlayerId]);
 
   useEffect(() => {
     const loop = () => {
@@ -994,7 +1607,12 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     window.addEventListener('keydown', e => { keys.current[e.code] = true; });
     window.addEventListener('keyup', e => { keys.current[e.code] = false; });
     window.addEventListener('mousemove', e => { mouse.current.x = e.clientX; mouse.current.y = e.clientY; });
-    window.addEventListener('mousedown', e => { if (e.button === 0) mouse.current.left = true; if (e.button === 2) mouse.current.right = true; });
+    window.addEventListener('mousedown', e => {
+      if (e.button === 0) mouse.current.left = true;
+      if (e.button === 2) mouse.current.right = true;
+      // Попытка подобрать конечность при клике
+      tryPickupLimb(e.button === 0 ? 'left' : 'right');
+    });
     window.addEventListener('mouseup', e => { if (e.button === 0) mouse.current.left = false; if (e.button === 2) mouse.current.right = false; });
     window.addEventListener('contextmenu', e => e.preventDefault());
     window.addEventListener('resize', () => { if (canvasRef.current) { canvasRef.current.width = window.innerWidth; canvasRef.current.height = window.innerHeight; } });
@@ -1003,7 +1621,26 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     return () => cancelAnimationFrame(requestRef.current);
   }, []);
 
-  const handleRestart = useCallback(() => {
+  // Респавн после смерти (сохраняет таймер и очки)
+  const handleRespawn = useCallback(() => {
+    const s = stateRef.current;
+    const ground = s.platforms[0];
+    const spawnX = ground.x + 100 + Math.random() * (ground.width - 200);
+    const spawnY = ground.y - 100;
+
+    s.player = getDefaultPlayerState();
+    s.player.x = spawnX;
+    s.player.y = spawnY;
+    s.projectiles = [];
+    s.vfx = [];
+    s.gameOver = false;
+    // НЕ сбрасываем: gameStartTime, gameEnded, score, star, enemies, detachedLimbs
+    s.camera = { x: spawnX - window.innerWidth / 2, y: spawnY - window.innerHeight / 2 };
+    setHudState({ ...s });
+  }, []);
+
+  // Полный перезапуск игры (сбрасывает всё)
+  const handleNewGame = useCallback(() => {
     const s = stateRef.current;
     const ground = s.platforms[0];
     const spawnX = ground.x + 100 + Math.random() * (ground.width - 200);
@@ -1015,8 +1652,12 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     s.enemies = [];
     s.projectiles = [];
     s.vfx = [];
+    s.detachedLimbs = [];
     s.score = 0;
     s.gameOver = false;
+    s.gameEnded = false;
+    s.gameStartTime = Date.now();
+    s.star = getInitialStar();
     s.camera = { x: spawnX - window.innerWidth / 2, y: spawnY - window.innerHeight / 2 };
     setHudState({ ...s });
 
@@ -1036,7 +1677,8 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       <canvas ref={canvasRef} width={window.innerWidth} height={window.innerHeight} className="flex-grow" />
       <HUD
         state={hudState}
-        onRestart={handleRestart}
+        onRespawn={handleRespawn}
+        onNewGame={handleNewGame}
         isPaused={isPaused}
         globalPaused={globalPaused}
         isMultiplayer={isMultiplayer}
@@ -1045,7 +1687,9 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
         onBackToMenu={onBackToMenu}
         onNameChange={onNameChange}
         localPlayerName={localPlayerName}
+        localPlayerId={localPlayerId}
         connectedPlayers={connectedPlayers}
+        playerScores={playerScoresRef.current}
       />
     </>
   );

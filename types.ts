@@ -20,6 +20,7 @@ export interface Limb {
   maxHp: number;
   exists: boolean;
   damageMultiplier?: number; // 1.0 = normal damage
+  damageFlashTimer?: number; // Таймер мигания красным при получении урона
 }
 
 export interface Weapon {
@@ -72,6 +73,43 @@ export interface ImpactVFX {
   size: number;
 }
 
+// Hitbox для конкретной части тела
+export interface LimbHitbox {
+  limbType: LimbType;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+// Оторванная конечность
+export interface DetachedLimb {
+  limbType: LimbType;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  width: number;
+  height: number;
+  color: string;
+  rotation: number;
+  rotationSpeed: number;
+  owner: 'PLAYER' | 'REMOTE_PLAYER';
+  ownerId?: string; // для удалённых игроков
+  hp: number; // Текущее HP конечности
+  maxHp: number; // Максимальное HP
+  destroyed?: boolean; // Если true - конечность сломана (0 HP), нельзя подобрать
+  destroyTime?: number; // Время когда конечность исчезнет (для сломанных)
+}
+
+// Звезда для удвоения очков
+export interface Star {
+  x: number;
+  y: number;
+  collected: boolean;
+  respawnTime?: number; // Время когда звезда появится снова
+}
+
 export interface GameState {
   player: Robot;
   enemies: Enemy[];
@@ -81,6 +119,11 @@ export interface GameState {
   camera: { x: number, y: number };
   score: number;
   gameOver: boolean;
+  detachedLimbs: DetachedLimb[]; // Оторванные конечности
+  star: Star; // Звезда для удвоения очков
+  gameStartTime: number; // Время начала игры
+  gameDuration: number; // Длительность игры в мс (5 минут = 300000)
+  gameEnded: boolean; // Игра закончена
 }
 
 export interface Platform {
@@ -115,7 +158,7 @@ export interface PlayerShot {
 }
 
 export interface NetworkMessage {
-  type: 'PLAYER_UPDATE' | 'PLAYER_SHOT' | 'ENEMY_SYNC' | 'PLAYER_DAMAGE' | 'GAME_STATE' | 'PLAYER_DIED' | 'ENEMY_DIED' | 'LIMB_LOST' | 'PLAYER_JOINED' | 'PLAYER_DISCONNECTED' | 'PLAYER_NAME_CHANGE' | 'PAUSE_TOGGLE' | 'GAME_START';
+  type: 'PLAYER_UPDATE' | 'PLAYER_SHOT' | 'ENEMY_SYNC' | 'PLAYER_DAMAGE' | 'GAME_STATE' | 'PLAYER_DIED' | 'ENEMY_DIED' | 'LIMB_LOST' | 'PLAYER_JOINED' | 'PLAYER_DISCONNECTED' | 'PLAYER_NAME_CHANGE' | 'PAUSE_TOGGLE' | 'GAME_START' | 'LIMB_DETACHED' | 'LIMB_ATTACHED' | 'STAR_COLLECTED' | 'GAME_END';
   playerId: string;
   data: any;
   timestamp: number;

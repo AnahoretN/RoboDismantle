@@ -15,7 +15,9 @@ export const COLORS = {
   ENEMY: '#ff0055',
   PLATFORM: '#333333',
   LASER: '#ffea00',
-  BG: '#0a0a0a'
+  BG: '#0a0a0a',
+  ARM: '#ffdd00', // Жёлтый для рук
+  LEG: '#00f2ff'  // Синий для ног
 };
 
 export const PLAYER_COLORS = [

@@ -4,7 +4,8 @@ import { ConnectionStatus, PlayerInfo } from '../lib/WebRTCManager';
 
 interface HUDProps {
   state: GameState;
-  onRestart: () => void;
+  onRespawn: () => void;
+  onNewGame: () => void;
   isPaused?: boolean;
   globalPaused?: boolean;
   isMultiplayer?: boolean;
@@ -13,12 +14,15 @@ interface HUDProps {
   onBackToMenu?: () => void;
   onNameChange?: (name: string) => void;
   localPlayerName?: string;
+  localPlayerId?: string;
   connectedPlayers?: PlayerInfo[];
+  playerScores?: Map<string, number>;
 }
 
 const HUD: React.FC<HUDProps> = ({
   state,
-  onRestart,
+  onRespawn,
+  onNewGame,
   isPaused = false,
   globalPaused = false,
   isMultiplayer = false,
@@ -27,16 +31,34 @@ const HUD: React.FC<HUDProps> = ({
   onBackToMenu,
   onNameChange,
   localPlayerName = 'Player',
-  connectedPlayers = []
+  localPlayerId = '',
+  connectedPlayers = [],
+  playerScores = new Map()
 }) => {
-  const { player, score, gameOver } = state;
+  const { player, score, gameOver, gameStartTime, gameDuration, gameEnded } = state;
   const [timer, setTimer] = useState(10);
   const [editingName, setEditingName] = useState(false);
   const [tempName, setTempName] = useState(localPlayerName);
+  const [gameTimeLeft, setGameTimeLeft] = useState(300); // 5 minutes in seconds
 
   useEffect(() => {
     setTempName(localPlayerName);
   }, [localPlayerName]);
+
+  // Game timer effect
+  useEffect(() => {
+    if (!gameStartTime || gameOver || gameEnded) return;
+
+    const updateTimer = () => {
+      const elapsed = Date.now() - gameStartTime;
+      const remaining = Math.max(0, Math.ceil((gameDuration - elapsed) / 1000));
+      setGameTimeLeft(remaining);
+    };
+
+    updateTimer();
+    const interval = setInterval(updateTimer, 1000);
+    return () => clearInterval(interval);
+  }, [gameStartTime, gameDuration, gameOver, gameEnded]);
 
   useEffect(() => {
     let interval: any;
@@ -112,12 +134,27 @@ const HUD: React.FC<HUDProps> = ({
     }
   };
 
+  const formatTime = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
   const isGamePaused = isPaused || globalPaused;
 
   return (
     <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-6">
-      {/* Top Center Score */}
+      {/* Top Center Score and Timer */}
       <div className="self-center flex flex-col items-center gap-2">
+        {/* Game Timer */}
+        {!gameEnded && !gameOver && (
+          <div className={`bg-black/40 px-6 py-1 rounded-full border border-white/10 backdrop-blur-sm ${gameTimeLeft <= 60 ? 'animate-pulse border-red-500/50' : ''}`}>
+            <span className={`font-mono text-lg tracking-widest ${gameTimeLeft <= 60 ? 'text-red-400' : 'text-yellow-400'}`}>
+              {formatTime(gameTimeLeft)}
+            </span>
+          </div>
+        )}
+
         <div className="bg-black/40 px-6 py-2 rounded-full border border-white/10 backdrop-blur-sm">
           <span className="text-cyan-500 font-mono text-xl tracking-widest">{score.toString().padStart(6, '0')}</span>
         </div>
@@ -253,7 +290,7 @@ const HUD: React.FC<HUDProps> = ({
             <div className="flex gap-4 justify-center">
               <button
                 disabled={timer > 0}
-                onClick={onRestart}
+                onClick={onRespawn}
                 className={`px-12 py-5 font-bold uppercase tracking-widest transition-all transform hover:scale-105 active:scale-95 shadow-[0_0_30px_rgba(6,182,212,0.5)] ${
                   timer > 0
                   ? 'bg-gray-700 text-gray-500 cursor-not-allowed opacity-50'
@@ -261,6 +298,90 @@ const HUD: React.FC<HUDProps> = ({
                 }`}
               >
                 System Re-Initialize
+              </button>
+
+              <button
+                onClick={() => onBackToMenu?.()}
+                className="px-12 py-5 font-bold uppercase tracking-widest transition-all transform hover:scale-105 active:scale-95 bg-white/10 text-white hover:bg-white/20 border border-white/20 rounded-lg"
+              >
+                Main Menu
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Game End Overlay (Victory Screen) */}
+      {gameEnded && !gameOver && (
+        <div className="absolute inset-0 bg-black/90 pointer-events-auto flex items-center justify-center backdrop-blur-xl">
+          <div className="text-center p-12 border-4 border-yellow-500/30 rounded-2xl bg-black/40 max-w-2xl">
+            <h1 className="text-6xl font-black text-yellow-400 italic tracking-tighter mb-2">GAME COMPLETE</h1>
+            <p className="text-xl text-white/80 uppercase tracking-[0.3em] mb-8">Final Rankings</p>
+
+            {/* Player Rankings */}
+            <div className="mb-8">
+              {(() => {
+                // Collect all player scores
+                const allScores: { name: string; score: number; isLocal: boolean; color: string }[] = [
+                  { name: localPlayerName, score: score, isLocal: true, color: '#00f2ff' }
+                ];
+
+                // Add connected players (use playerScores if available, otherwise 0)
+                connectedPlayers.forEach((p) => {
+                  if (p.id !== localPlayerId) {
+                    allScores.push({
+                      name: p.name,
+                      score: playerScores.get(p.id) || 0,
+                      isLocal: false,
+                      color: p.color
+                    });
+                  }
+                });
+
+                // Sort by score descending
+                allScores.sort((a, b) => b.score - a.score);
+
+                const getRankMedal = (rank: number): string => {
+                  switch (rank) {
+                    case 1: return '🥇';
+                    case 2: return '🥈';
+                    case 3: return '🥉';
+                    default: return `#${rank}`;
+                  }
+                };
+
+                return allScores.map((p, idx) => (
+                  <div
+                    key={idx}
+                    className={`flex items-center justify-between px-6 py-3 mb-2 rounded-lg ${
+                      p.isLocal ? 'bg-cyan-500/20 border border-cyan-500/30' : 'bg-white/5'
+                    }`}
+                  >
+                    <div className="flex items-center gap-4">
+                      <span className="text-2xl">{getRankMedal(idx + 1)}</span>
+                      <div
+                        className="w-4 h-4 rounded-full"
+                        style={{ backgroundColor: p.color, boxShadow: `0 0 10px ${p.color}` }}
+                      />
+                      <span className={`text-lg font-bold ${p.isLocal ? 'text-cyan-400' : 'text-white'}`}>
+                        {p.name}
+                        {p.isLocal && <span className="text-xs text-cyan-500 ml-2">(YOU)</span>}
+                      </span>
+                    </div>
+                    <span className="text-xl font-mono text-yellow-400">
+                      {p.score.toString().padStart(6, '0')}
+                    </span>
+                  </div>
+                ));
+              })()}
+            </div>
+
+            <div className="flex gap-4 justify-center">
+              <button
+                onClick={onNewGame}
+                className="px-12 py-5 font-bold uppercase tracking-widest transition-all transform hover:scale-105 active:scale-95 shadow-[0_0_30px_rgba(6,182,212,0.5)] bg-cyan-500 text-black hover:bg-white"
+              >
+                Play Again
               </button>
 
               <button
