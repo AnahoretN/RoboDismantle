@@ -165,11 +165,6 @@ const HUD: React.FC<HUDProps> = ({
             {getConnectionStatusText()} {connectedPlayers.length > 0 && `(${connectedPlayers.length}/4)`}
           </div>
         )}
-
-        {/* Vital Protection Indicator */}
-        <div className="bg-cyan-500/10 border border-cyan-500/30 px-4 py-1 rounded text-[10px] uppercase font-black text-cyan-400 backdrop-blur-sm tracking-widest">
-          Vital Plating Integrity: {resistancePercent}%
-        </div>
       </div>
 
       {/* Connected Players List (in multiplayer) */}
