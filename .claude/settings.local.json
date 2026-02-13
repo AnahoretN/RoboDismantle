@@ -17,7 +17,9 @@
       "Bash(git add:*)",
       "Bash(git push:*)",
       "Bash(ls:*)",
-      "Bash(git restore:*)"
+      "Bash(git restore:*)",
+      "Bash(git --no-pager=1 status --short)",
+      "Bash(git checkout:*)"
     ]
   }
 }
