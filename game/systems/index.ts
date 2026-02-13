@@ -10,3 +10,5 @@ export * from './PerformanceMonitor';
 export * from './LimbSystem';
 export * from './InputSystem';
 export * from './GameLoopSystem';
+export * from './ImmutableState';
+export * from './DirtyRegionSystem';
