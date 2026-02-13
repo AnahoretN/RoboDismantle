@@ -4,11 +4,49 @@ import {
   Limb, GameMode, RemotePlayer, NetworkMessage, Star
 } from '../types';
 import {
-  GRAVITY, FRICTION, PLAYER_SPEED, PLAYER_JUMP, ACCELERATION_TIME,
-  ROBOT_SIZE, BULLET_SPEED, ARM_MAX_HP, LEG_MAX_HP, TORSO_MAX_HP, HEAD_MAX_HP, COLORS, PLAYER_COLORS
+  BULLET_SPEED, COLORS, PLAYER_COLORS,
+  // Константы для спавна
+  ENEMY_SPAWN_MARGIN, ENEMY_BASE_HP, ENEMY_MIN_FIRE_RATE, ENEMY_FIRE_RATE_VARIANCE,
+  ENEMY_WIDTH, ENEMY_HEIGHT,
+  // Коллизии
+  LIMB_PICKUP_DISTANCE, LIMB_DESTROY_TIME,
+  // VFX
+  VFX_HIT_SIZE, VFX_DESTROY_SIZE,
+  // Игра
+  PROJECTILE_WIDTH, PROJECTILE_HEIGHT, PROJECTILE_DAMAGE_PLAYER,
+  // Сеть
+  NETWORK_UPDATE_RATE, ENEMY_SYNC_RATE, ENEMY_INTERPOLATION_TIME,
+  // Таймер
+  DAMAGE_FLASH_DURATION
 } from '../constants';
 import HUD from './HUD';
 import { WebRTCManager, ConnectionStatus, PlayerInfo } from '../lib/WebRTCManager';
+// Системы
+import { createDefaultPlayer, createDefaultLimbs } from '../game/utils/playerFactory';
+import {
+  TimeState,
+  createTimeState,
+  updateTime,
+  getDeltaFactor
+} from '../game/systems/TimeSystem';
+import {
+  checkLimbHit,
+  checkPlatformCollisions,
+  checkCollision
+} from '../game/systems/CollisionSystem';
+import {
+  spawnHitVFX,
+  spawnDestroyVFX,
+  spawnPickupVFX,
+  updateVFX
+} from '../game/systems/VFXSystem';
+import {
+  PreviousState,
+  createPreviousState,
+  computeDelta,
+  updatePreviousState,
+  NetworkThrottle
+} from '../game/systems/NetworkSyncSystem';
 
 // Враг на клиенте с ID
 interface EnemyWithId extends Enemy {
@@ -72,6 +110,11 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
   // Очки удалённых игроков (для экрана победы)
   const playerScoresRef = useRef<Map<string, number>>(new Map());
 
+  // Delta time и сетевая оптимизация
+  const timeStateRef = useRef<TimeState>(createTimeState());
+  const networkThrottleRef = useRef<NetworkThrottle>(new NetworkThrottle(NETWORK_UPDATE_RATE));
+  const previousPlayerStateRef = useRef<PreviousState | null>(null);
+
   // Определяем режим мультиплеера и роль игрока
   const isMultiplayer = gameMode === GameMode.MULTI_PLAYER;
   const isHost = webrtcManager?.isHostMode() ?? false;
@@ -112,23 +155,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     return p;
   });
 
-  const getDefaultPlayerState = (): Robot => ({
-    x: 100, y: 300, width: ROBOT_SIZE, height: ROBOT_SIZE * 1.5,
-    vx: 0, vy: 0, facing: 0, isJumping: false, onGround: false,
-    stunTimer: 0,
-    moveStartTime: undefined,
-    lastMoveDir: 0,
-    limbs: {
-      [LimbType.TORSO]: { type: LimbType.TORSO, hp: TORSO_MAX_HP, maxHp: TORSO_MAX_HP, exists: true, damageMultiplier: 1.0 },
-      [LimbType.HEAD]: { type: LimbType.HEAD, hp: HEAD_MAX_HP, maxHp: HEAD_MAX_HP, exists: true, damageMultiplier: 1.0 },
-      [LimbType.LEFT_ARM]: { type: LimbType.LEFT_ARM, hp: ARM_MAX_HP, maxHp: ARM_MAX_HP, exists: true, damageMultiplier: 1.0 },
-      [LimbType.RIGHT_ARM]: { type: LimbType.RIGHT_ARM, hp: ARM_MAX_HP, maxHp: ARM_MAX_HP, exists: true, damageMultiplier: 1.0 },
-      [LimbType.LEFT_LEG]: { type: LimbType.LEFT_LEG, hp: LEG_MAX_HP, maxHp: LEG_MAX_HP, exists: true, damageMultiplier: 1.0 },
-      [LimbType.RIGHT_LEG]: { type: LimbType.RIGHT_LEG, hp: LEG_MAX_HP, maxHp: LEG_MAX_HP, exists: true, damageMultiplier: 1.0 },
-    },
-    leftWeapon: { name: 'Plasma', type: 'PROJECTILE', cooldown: 200, lastFired: 0, color: COLORS.ARM },
-    rightWeapon: { name: 'Laser', type: 'PROJECTILE', cooldown: 150, lastFired: 0, color: COLORS.ARM },
-  });
+  // getDefaultPlayerState заменён на createDefaultPlayer из playerFactory
 
   // Find top platform for star spawn
   const getTopPlatform = () => {
@@ -147,7 +174,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
   };
 
   const stateRef = useRef<GameState>({
-    player: getDefaultPlayerState(),
+    player: createDefaultPlayer(100, 300),
     enemies: [],
     projectiles: [],
     platforms: basePlatforms,
@@ -197,11 +224,11 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
             }
           } else {
             const newPlayer: RemotePlayer = {
-              ...getDefaultPlayerState(),
+              ...createDefaultPlayer(100, 300),
               id,
               color: PLAYER_COLORS[Math.min(connectedPlayers.length, 3)],
               x, y, vx, vy, facing,
-              limbs: limbs || getDefaultPlayerState().limbs
+              limbs: limbs || createDefaultPlayer(100, 300).limbs
             };
             if (onGround !== undefined) newPlayer.onGround = onGround;
             remotePlayersRef.current.set(id, newPlayer);
@@ -246,12 +273,12 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
           const { id, color } = message.data;
           if (!remotePlayersRef.current.has(id)) {
             const newPlayer: RemotePlayer = {
-              ...getDefaultPlayerState(),
+              ...createDefaultPlayer(100, 300),
               id,
               color: color || PLAYER_COLORS[1],
               x: 100, y: 300,
               vx: 0, vy: 0, facing: 0,
-              limbs: getDefaultPlayerState().limbs
+              limbs: createDefaultPlayer(100, 300).limbs
             };
             remotePlayersRef.current.set(id, newPlayer);
           }
@@ -339,7 +366,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
           const spawnX = ground.x + 100 + Math.random() * (ground.width - 200);
           const spawnY = ground.y - 100;
 
-          s.player = getDefaultPlayerState();
+          s.player = createDefaultPlayer(spawnX, spawnY);
           s.player.x = spawnX;
           s.player.y = spawnY;
           s.enemies = [];
@@ -1666,7 +1693,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     const spawnX = ground.x + 100 + Math.random() * (ground.width - 200);
     const spawnY = ground.y - 100;
 
-    s.player = getDefaultPlayerState();
+    s.player = createDefaultPlayer(spawnX, spawnY);
     s.player.x = spawnX;
     s.player.y = spawnY;
     s.projectiles = [];
@@ -1684,7 +1711,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     const spawnX = ground.x + 100 + Math.random() * (ground.width - 200);
     const spawnY = ground.y - 100;
 
-    s.player = getDefaultPlayerState();
+    s.player = createDefaultPlayer(spawnX, spawnY);
     s.player.x = spawnX;
     s.player.y = spawnY;
     s.enemies = [];
