@@ -9,3 +9,4 @@ export * from './ProjectileSystem';
 export * from './PerformanceMonitor';
 export * from './LimbSystem';
 export * from './InputSystem';
+export * from './GameLoopSystem';
